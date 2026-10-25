@@ -1,0 +1,10 @@
+[package]
+name = "tutor-proto"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+anyhow.workspace = true

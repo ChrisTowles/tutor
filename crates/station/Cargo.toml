@@ -1,0 +1,18 @@
+[package]
+name = "tutor-station"
+description = "Runs on a kid's PC: streams screen, camera and audio to tutor, applies Dad's input"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tutor-proto.workspace = true
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+gstreamer.workspace = true
+gstreamer-app.workspace = true
+gstreamer-video.workspace = true
+smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+evdev = "0.13"

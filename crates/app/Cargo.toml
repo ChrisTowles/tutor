@@ -1,0 +1,19 @@
+[package]
+name = "tutor"
+description = "One window to see, hear, talk to and drive the kids' PCs"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tutor-proto.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+crossbeam-channel.workspace = true
+gstreamer.workspace = true
+gstreamer-app.workspace = true
+gtk4 = { version = "0.11", features = ["v4_14"] }
+gst-plugin-gtk4 = { version = "0.15", features = ["wayland", "gtk_v4_14"] }
+async-channel = "2"
+toml = "1"
+sha2 = "0.10"
