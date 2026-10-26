@@ -2,6 +2,7 @@
 
 mod config;
 mod media;
+mod settings;
 mod station;
 mod ui;
 

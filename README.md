@@ -41,6 +41,10 @@ headset = "Jabra"
 camera = "/dev/video0"
 ```
 
+`~/.config/tutor/settings.toml` is written by the app and remembers the last layout: which PC was on screen, Talk,
+Hear apps, sidebar width, and per PC the screen quality and where your cam sits. Delete it to reset.
+
+
 ## Each kid's PC needs
 
 - SSH access from Dad's PC with his key (`ssh -o BatchMode=yes <host> true` works).

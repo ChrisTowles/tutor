@@ -58,3 +58,44 @@ Running log while building against [docs/plan.html](docs/plan.html).
   dropdown buttons now ellipsize, pickers stack under their labels, card thumbnails are 72 px, and the paned may clip
   the sidebar (`shrink_end_child`) so the divider always drags further.
 - **"⌨ Shortcuts (F1)" button** replaces the hint line: a popover listing every key and mouse trick.
+- **Presence: locked / asleep / idle** (not in the plan), after Dad couldn't tell a connected-but-asleep PC from a
+  broken one. Protocol v3 adds `FromStation::Presence` (logind `LockedHint` polled every 3 s, wlr output power for
+  display off, `ext_idle_notifier` at 60 s) and `ToStation::Wake` (a Shift tap). While locked or asleep a banner over
+  the screen says so with a **Wake & unlock** button; the sidebar button does the same. The kid's card shows
+  "🔒 locked", "💤 screen asleep" or "idle".
+- **One station per PC.** An orphaned station from an earlier session was still running (holding the camera and
+  audio route). A new station now kills any older `tutor-station` before starting.
+- **Connection health pill** (not in the plan), after Dad saw lag with nothing on screen saying so. Protocol v4 adds
+  `ToStation::Ping` / `FromStation::Pong { dropped }`: the app pings every 500 ms through the same queues as
+  everything else, so a backed-up link shows as a long round trip. Bottom-right of the screen view:
+  "● 3 ms · 30 fps · 2.1 Mb/s", amber "⚠ Laggy" at ≥150 ms or any frame the station dropped, red "⚠ Stalled" after
+  1.5 s with no reply. The card shows "⚠ laggy"/"⚠ stalled". Each lag episode is logged (`LAG` / `ok again`);
+  `TUTOR_LINK_LOG=1` logs every sample. First minute on Logan's PC: median 2 ms, p90 4 ms, one 465 ms spike.
+- **Lag cause found: Wi-Fi power saving on Logan's PC.** Both PCs are on Wi-Fi (same 5 GHz AP, channel 36). Logan's
+  MediaTek MT7925 has power saving **on**: `/etc/NetworkManager/conf.d/99-wifi-powersave-off.conf` (=2) sorts
+  *before* `default-wifi-powersave-on.conf` (=3), so the "on" file wins (`NetworkManager --print-config` →
+  `wifi.powersave=3`). Dad's PC has it off. The stall pattern fits: ~25 s with round trips of 1–3.4 s at only
+  ~1–4 Mbit/s (not bandwidth), no frames lost to the encoder. Fix needs sudo on his PC.
+- **Screen quality picker** (not in the plan): Full / Half / Low per PC, protocol v5 `Streams::screen_scale`. The
+  station scales on the CPU (`videoscale n-threads=4`) before NVENC and divides the bitrate by the same factor.
+  GPU scaling via `glcolorscale` into `nvh264enc` failed to negotiate on his PC; CPU scaling of 3440×1440 at 30 fps
+  measured ~⅔ of one core.
+- **Movable cam overlay** (plan: fixed top-left). Protocol v6 `Streams::dad_cam_at` is where the overlay's centre goes
+  in their screen's 0..ABS_MAX space; the station turns it into layer-shell margins (kept 16 px inside the edges)
+  from the output's logical size. In the app, Shift+drag on their screen moves it live (you see it move in their
+  stream); remembered per PC for the app's lifetime. Half quality confirmed working by Dad.
+- **Settings survive restarts** in `~/.config/tutor/settings.toml` (app-written; `tutor.toml` stays hand-edited):
+  selected PC, Talk, Hear apps, sidebar width, and per PC (by name) screen quality, My cam and its position. Written
+  500 ms after the last change and on close. Control is never restored (always starts off). A missing or broken file
+  falls back to defaults.
+- **Lockup during Split Fiction: GPU memory full.** The game used 7.3 of the RTX 5060's 8 GB. Switching to Low rebuilt
+  the encoder; NVENC couldn't start and `nvh264enc` aborted (`gst_nv_base_enc_set_format: code should not be
+  reached`), killing the station. The new station picked `nvh264enc` because the registry still listed it, but
+  CUDA couldn't start in that process, so every build failed ("no property preset"). The station retried on every
+  frame: 16k errors to Dad (the window froze handling them) and a leaked socket pair per attempt until it hit 1024
+  open files. Fixes: the station probes NVENC by creating the element and drops to `openh264enc` when a build fails;
+  a failed build waits 5 s before retrying; repeated status messages are dropped on both sides. Low quality on the
+  CPU encoder runs at ~9% CPU on his PC.
+- **"Off" screen quality.** Stops screen capture (fps 0) and tears down the encoder so a game keeps every frame and
+  its GPU memory; voice, webcam and Dad's cam keep running. The screen view shows a "Screen sharing is off" banner.
+  Turning it back on re-probes NVENC, since the GPU may have room again.

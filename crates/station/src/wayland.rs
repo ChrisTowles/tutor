@@ -31,7 +31,7 @@ use smithay_client_toolkit::{
         slot::{Buffer, SlotPool},
     },
 };
-use tutor_proto::{FromStation, VERSION};
+use tutor_proto::{ABS_MAX, FromStation, VERSION};
 use wayland_client::{
     Connection, QueueHandle, WEnum,
     globals::registry_queue_init,
@@ -49,10 +49,24 @@ use wayland_protocols::ext::{
     },
 };
 
+use wayland_client::protocol::wl_seat;
+use wayland_protocols::ext::idle_notify::v1::client::{
+    ext_idle_notification_v1::{self, ExtIdleNotificationV1},
+    ext_idle_notifier_v1::ExtIdleNotifierV1,
+};
+use wayland_protocols_wlr::output_power_management::v1::client::{
+    zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1,
+    zwlr_output_power_v1::{self, ZwlrOutputPowerV1},
+};
+
 use crate::{
     media::{DAD_CAM_SIZE, Media},
     out::Out,
+    presence::Reporter,
 };
+
+/// How long without input before their PC counts as idle.
+const IDLE_MS: u32 = 60_000;
 
 /// Messages into the Wayland thread from the rest of the station.
 pub enum LoopMsg {
@@ -60,6 +74,8 @@ pub enum LoopMsg {
     Fps(u8),
     /// A decoded BGRx frame of `DAD_CAM_SIZE`, or `None` to hide the overlay.
     DadCam(Option<Vec<u8>>),
+    /// Move the overlay's centre (see `Streams::dad_cam_at`).
+    DadCamAt((u16, u16)),
     Quit,
 }
 
@@ -73,7 +89,7 @@ const SHM_FORMATS: [(wl_shm::Format, &str); 4] = [
     (wl_shm::Format::Abgr8888, "RGBA"),
 ];
 
-/// Overlay position, inside the area panels leave free.
+/// Closest the overlay gets to a screen edge, inside the area panels leave free.
 const OVERLAY_MARGIN: i32 = 16;
 
 pub struct Wl {
@@ -97,6 +113,11 @@ pub struct Wl {
     hello_sent: bool,
 
     overlay: Option<Overlay>,
+    dad_cam_at: (u16, u16),
+    presence: Arc<Reporter>,
+    power_manager: Option<ZwlrOutputPowerManagerV1>,
+    _power: Option<ZwlrOutputPowerV1>,
+    _idle: Option<ExtIdleNotificationV1>,
     pub exit: bool,
 }
 
@@ -122,10 +143,24 @@ struct Overlay {
 }
 
 impl Wl {
-    pub fn connect(handle: LoopHandle<'static, Wl>, media: Arc<Media>, out: Out, hostname: String) -> Result<Self> {
+    pub fn connect(
+        handle: LoopHandle<'static, Wl>,
+        media: Arc<Media>,
+        out: Out,
+        hostname: String,
+        presence: Arc<Reporter>,
+    ) -> Result<Self> {
         let conn = Connection::connect_to_env().context("connect to the Wayland session")?;
         let (globals, queue) = registry_queue_init(&conn).context("list Wayland globals")?;
         let qh = queue.handle();
+        let idle = match (
+            globals.bind::<ExtIdleNotifierV1, _, _>(&qh, 1..=1, Global),
+            globals.bind::<wl_seat::WlSeat, _, _>(&qh, 1..=1, Global),
+        ) {
+            (Ok(notifier), Ok(seat)) => Some(notifier.get_idle_notification(IDLE_MS, &seat, &qh, Global)),
+            _ => None,
+        };
+        let power_manager = globals.bind(&qh, 1..=1, Global).ok();
         let state = Self {
             registry: RegistryState::new(&globals),
             outputs: OutputState::new(&globals, &qh),
@@ -147,6 +182,11 @@ impl Wl {
             timer_armed: false,
             hello_sent: false,
             overlay: None,
+            dad_cam_at: (0, 0),
+            presence,
+            power_manager,
+            _power: None,
+            _idle: idle,
             exit: false,
         };
         WaylandSource::new(conn, queue)
@@ -163,6 +203,10 @@ impl Wl {
             }
             LoopMsg::DadCam(Some(frame)) => self.show_dad_cam(frame),
             LoopMsg::DadCam(None) => self.overlay = None,
+            LoopMsg::DadCamAt(at) => {
+                self.dad_cam_at = at;
+                self.place_overlay();
+            }
             LoopMsg::Quit => self.exit = true,
         }
     }
@@ -223,7 +267,7 @@ impl Wl {
                 hostname: self.hostname.clone(),
                 width: w,
                 height: h,
-                encoder: self.media.encoder.to_string(),
+                encoder: self.media.encoder().to_string(),
             });
         }
         self.maybe_capture();
@@ -310,6 +354,25 @@ impl Wl {
         });
     }
 
+    /// Margins from the top-left that put the overlay's centre at `dad_cam_at`.
+    fn place_overlay(&mut self) {
+        let Some(overlay) = &self.overlay else { return };
+        let (sw, sh) = self
+            .outputs
+            .outputs()
+            .next()
+            .and_then(|o| self.outputs.info(&o)?.logical_size)
+            .unwrap_or((1920, 1080));
+        let (w, h) = (DAD_CAM_SIZE.0 as i32, DAD_CAM_SIZE.1 as i32);
+        let axis = |at: u16, screen: i32, size: i32| {
+            let centre = (at as f64 / ABS_MAX as f64 * screen as f64) as i32;
+            (centre - size / 2).clamp(OVERLAY_MARGIN, (screen - size - OVERLAY_MARGIN).max(OVERLAY_MARGIN))
+        };
+        let (left, top) = (axis(self.dad_cam_at.0, sw, w), axis(self.dad_cam_at.1, sh, h));
+        overlay.layer.set_margin(top, 0, 0, left);
+        overlay.layer.commit();
+    }
+
     fn show_dad_cam(&mut self, frame: Vec<u8>) {
         if self.overlay.is_none() {
             let Some(layer_shell) = &self.layer_shell else {
@@ -324,12 +387,11 @@ impl Wl {
             }
             let layer = layer_shell.create_layer_surface(&self.qh, surface, Layer::Overlay, Some("tutor-dad-cam"), None);
             layer.set_anchor(Anchor::TOP | Anchor::LEFT);
-            layer.set_margin(OVERLAY_MARGIN, 0, 0, OVERLAY_MARGIN);
             layer.set_size(w, h);
             layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-            layer.commit();
             let Ok(pool) = SlotPool::new((w * h * 4 * 2) as usize, &self.shm) else { return };
             self.overlay = Some(Overlay { layer, pool, configured: false, pending: None });
+            self.place_overlay();
         }
         let overlay = self.overlay.as_mut().unwrap();
         overlay.pending = Some(frame);
@@ -372,6 +434,37 @@ impl Dispatch2<ExtOutputImageCaptureSourceManagerV1, Wl> for Global {
 
 impl Dispatch2<ExtImageCaptureSourceV1, Wl> for Global {
     fn event(&self, _: &mut Wl, _: &ExtImageCaptureSourceV1, _: <ExtImageCaptureSourceV1 as wayland_client::Proxy>::Event, _: &Connection, _: &QueueHandle<Wl>) {}
+}
+
+impl Dispatch2<wl_seat::WlSeat, Wl> for Global {
+    fn event(&self, _: &mut Wl, _: &wl_seat::WlSeat, _: wl_seat::Event, _: &Connection, _: &QueueHandle<Wl>) {}
+}
+
+impl Dispatch2<ExtIdleNotifierV1, Wl> for Global {
+    fn event(&self, _: &mut Wl, _: &ExtIdleNotifierV1, _: <ExtIdleNotifierV1 as wayland_client::Proxy>::Event, _: &Connection, _: &QueueHandle<Wl>) {}
+}
+
+impl Dispatch2<ExtIdleNotificationV1, Wl> for Global {
+    fn event(&self, wl: &mut Wl, _: &ExtIdleNotificationV1, event: ext_idle_notification_v1::Event, _: &Connection, _: &QueueHandle<Wl>) {
+        match event {
+            ext_idle_notification_v1::Event::Idled => wl.presence.update(|p| p.idle = true),
+            ext_idle_notification_v1::Event::Resumed => wl.presence.update(|p| p.idle = false),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch2<ZwlrOutputPowerManagerV1, Wl> for Global {
+    fn event(&self, _: &mut Wl, _: &ZwlrOutputPowerManagerV1, _: <ZwlrOutputPowerManagerV1 as wayland_client::Proxy>::Event, _: &Connection, _: &QueueHandle<Wl>) {}
+}
+
+impl Dispatch2<ZwlrOutputPowerV1, Wl> for Global {
+    fn event(&self, wl: &mut Wl, _: &ZwlrOutputPowerV1, event: zwlr_output_power_v1::Event, _: &Connection, _: &QueueHandle<Wl>) {
+        if let zwlr_output_power_v1::Event::Mode { mode } = event {
+            let off = matches!(mode, WEnum::Value(zwlr_output_power_v1::Mode::Off));
+            wl.presence.update(|p| p.display_off = off);
+        }
+    }
 }
 
 impl Dispatch2<ExtImageCopyCaptureSessionV1, Wl> for SessionData {
@@ -425,10 +518,13 @@ impl OutputHandler for Wl {
         &mut self.outputs
     }
 
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+    fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         // One monitor per kid's PC: capture the first one.
         if self.capture.is_none() {
             self.start_session(&output);
+            if let Some(pm) = &self.power_manager {
+                self._power = Some(pm.get_output_power(&output, qh, Global));
+            }
         }
     }
 

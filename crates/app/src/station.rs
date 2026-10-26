@@ -8,7 +8,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -17,11 +17,16 @@ use std::{
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
 use sha2::{Digest, Sha256};
-use tutor_proto::{FromStation, ToStation, VERSION, Streams, read_frame, write_frame};
+use tutor_proto::{Presence, FromStation, ToStation, VERSION, Streams, read_frame, write_frame};
 
 use crate::{config::StationConfig, media::Playback};
 
 const RETRY: Duration = Duration::from_secs(10);
+const PING_EVERY: Duration = Duration::from_millis(500);
+/// Round trip above this, or any dropped frame, counts as laggy.
+pub const LAGGY_MS: u32 = 150;
+/// No reply for this long counts as stalled.
+pub const STALLED_MS: u32 = 1500;
 const REMOTE_BIN: &str = ".local/bin/tutor-station";
 
 pub enum Event {
@@ -31,6 +36,42 @@ pub enum Event {
     /// Their voice level, 0..1.
     Level(f64),
     Devices(Devices),
+    Presence(Presence),
+    Link(Link),
+}
+
+/// How the connection is doing, every `PING_EVERY`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Link {
+    /// Last round trip, through every queue on both sides.
+    pub rtt_ms: u32,
+    /// How long since the last reply.
+    pub silent_ms: u32,
+    pub fps: u32,
+    pub kbps: u32,
+    /// Screen frames the station dropped since the last report.
+    pub dropped: u32,
+}
+
+impl Link {
+    pub fn stalled(&self) -> bool {
+        self.silent_ms >= STALLED_MS
+    }
+
+    pub fn laggy(&self) -> bool {
+        self.stalled() || self.rtt_ms >= LAGGY_MS || self.dropped > 0
+    }
+}
+
+/// Counters the reader fills and the pinger reports.
+#[derive(Default)]
+struct Stats {
+    frames: AtomicU32,
+    bytes: AtomicU64,
+    dropped: AtomicU32,
+    rtt_us: AtomicU64,
+    /// Microseconds since `Station::epoch` of the last pong.
+    pong_at: AtomicU64,
 }
 
 /// Their outputs and mics as (name, description), and the ones in use.
@@ -51,6 +92,8 @@ pub struct Station {
     stopping: AtomicBool,
     child: Mutex<Option<Child>>,
     pub playback: Playback,
+    epoch: Instant,
+    stats: Stats,
 }
 
 impl Station {
@@ -65,6 +108,8 @@ impl Station {
             stopping: AtomicBool::new(false),
             child: Mutex::new(None),
             playback,
+            epoch: Instant::now(),
+            stats: Stats::default(),
         })
     }
 
@@ -134,7 +179,7 @@ impl Station {
         Ok(())
     }
 
-    fn session(&self, events: &async_channel::Sender<Event>) -> Result<()> {
+    fn session(self: &Arc<Self>, events: &async_channel::Sender<Event>) -> Result<()> {
         deploy(&self.config.host)?;
         let mut child = Command::new("ssh")
             .args(ssh_opts())
@@ -172,6 +217,7 @@ impl Station {
             })
         };
 
+        let pinger = self.spawn_pinger(alive.clone(), events.clone());
         let result = self.read_loop(BufReader::with_capacity(1 << 20, stdout), events);
         alive.store(false, Ordering::Relaxed);
         if let Some(mut child) = self.child.lock().unwrap().take() {
@@ -179,11 +225,59 @@ impl Station {
             let _ = child.wait();
         }
         let _ = writer.join();
+        let _ = pinger.join();
         result
+    }
+
+    fn now_us(&self) -> u64 {
+        self.epoch.elapsed().as_micros() as u64
+    }
+
+    /// Pings through the same queues as everything else, so a backed-up link
+    /// shows as a long round trip, and reports a `Link` each time.
+    fn spawn_pinger(self: &Arc<Self>, alive: Arc<AtomicBool>, events: async_channel::Sender<Event>) -> thread::JoinHandle<()> {
+        let me = self.clone();
+        thread::spawn(move || {
+            // 0 until the first pong: the station's startup isn't lag.
+            me.stats.pong_at.store(0, Ordering::Relaxed);
+            let mut last = Instant::now();
+            let mut was_laggy = false;
+            while alive.load(Ordering::Relaxed) {
+                thread::sleep(PING_EVERY);
+                let now = me.now_us();
+                if !me.online() {
+                    continue;
+                }
+                let _ = me.tx.try_send(ToStation::Ping(now));
+                let pong_at = me.stats.pong_at.load(Ordering::Relaxed);
+                if pong_at == 0 {
+                    continue;
+                }
+                let secs = last.elapsed().as_secs_f64().max(0.001);
+                last = Instant::now();
+                let link = Link {
+                    rtt_ms: (me.stats.rtt_us.load(Ordering::Relaxed) / 1000) as u32,
+                    silent_ms: (now.saturating_sub(pong_at) / 1000) as u32,
+                    fps: (me.stats.frames.swap(0, Ordering::Relaxed) as f64 / secs).round() as u32,
+                    kbps: (me.stats.bytes.swap(0, Ordering::Relaxed) as f64 * 8.0 / 1000.0 / secs) as u32,
+                    dropped: me.stats.dropped.swap(0, Ordering::Relaxed),
+                };
+                // A log line per lag episode, for working out what caused it later.
+                if link.laggy() != was_laggy {
+                    was_laggy = link.laggy();
+                    eprintln!("tutor: {} {} {link:?}", me.config.name, if was_laggy { "LAG" } else { "ok again" });
+                }
+                if std::env::var_os("TUTOR_LINK_LOG").is_some() {
+                    eprintln!("link {} {link:?}", me.config.name);
+                }
+                let _ = events.try_send(Event::Link(link));
+            }
+        })
     }
 
     fn read_loop(&self, mut r: impl std::io::Read, events: &async_channel::Sender<Event>) -> Result<()> {
         let mut level = Level::default();
+        let mut last_status: Option<String> = None;
         while let Some(msg) = read_frame::<FromStation>(&mut r)? {
             match msg {
                 FromStation::Hello { version, hostname, width, height, encoder } => {
@@ -196,7 +290,17 @@ impl Station {
                     let _ = self.tx.try_send(ToStation::Streams(self.streams()));
                     let _ = events.send_blocking(Event::Online { hostname, encoder });
                 }
-                FromStation::Video { data, .. } => self.playback.video(data),
+                FromStation::Video { data, .. } => {
+                    self.stats.frames.fetch_add(1, Ordering::Relaxed);
+                    self.stats.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    self.playback.video(data)
+                }
+                FromStation::Pong { t, dropped } => {
+                    let now = self.now_us();
+                    self.stats.rtt_us.store(now.saturating_sub(t), Ordering::Relaxed);
+                    self.stats.pong_at.store(now, Ordering::Relaxed);
+                    self.stats.dropped.fetch_add(dropped, Ordering::Relaxed);
+                }
                 FromStation::KidCam(jpeg) => self.playback.cam(jpeg),
                 FromStation::KidVoice(pcm) => {
                     if let Some(l) = level.feed(&pcm) {
@@ -208,7 +312,13 @@ impl Station {
                 FromStation::Devices { outputs, output, mics, mic } => {
                     let _ = events.send_blocking(Event::Devices(Devices { outputs, output, mics, mic }));
                 }
+                FromStation::Presence(p) => {
+                    let _ = events.send_blocking(Event::Presence(p));
+                }
+                // An old station could send one error per frame; showing each froze the window.
+                FromStation::Status(s) if last_status.as_deref() == Some(s.as_str()) => {}
                 FromStation::Status(s) => {
+                    last_status = Some(s.clone());
                     eprintln!("tutor: {}: {s}", self.config.name);
                     let _ = events.send_blocking(Event::Status(s));
                 }

@@ -6,6 +6,7 @@ mod audio_route;
 mod input;
 mod media;
 mod out;
+mod presence;
 mod wayland;
 
 use std::{
@@ -76,6 +77,7 @@ fn session_env() {
 }
 
 fn main() -> Result<()> {
+    replace_older();
     session_env();
     let args = parse_args()?;
     gstreamer::init()?;
@@ -88,6 +90,9 @@ fn main() -> Result<()> {
         route.lock().unwrap().as_ref().map(|r| (r.sink.clone(), r.source.clone())).unwrap_or_default();
     let media = Arc::new(Media::new(out.clone(), loop_tx.clone(), sink, source, args.camera));
     send_devices(&out, &route);
+    let presence = Arc::new(presence::Reporter::new(out.clone()));
+    presence.announce();
+    presence::watch_lock(presence.clone());
     let watcher = watch_devices(route.clone(), media.clone(), out.clone());
     let mut injector = Injector::new().map_err(|e| out.status(format!("control: {e:#}"))).ok();
 
@@ -113,6 +118,14 @@ fn main() -> Result<()> {
                     Ok(Some(ToStation::DadVoice(pcm))) => media.dad_voice(pcm),
                     Ok(Some(ToStation::DadCam(jpeg))) => media.dad_cam(jpeg),
                     Ok(Some(ToStation::Keyframe)) => media.force_keyframe(),
+                    Ok(Some(ToStation::Ping(t))) => out.send(FromStation::Pong { t, dropped: out.take_dropped() }),
+                    Ok(Some(ToStation::Wake)) => {
+                        if let Some(inj) = &mut injector
+                            && let Err(e) = inj.wake()
+                        {
+                            out.status(format!("wake: {e:#}"));
+                        }
+                    }
                     Ok(Some(ToStation::SetMic(mic))) => {
                         if let Some(r) = route.lock().unwrap().as_mut() {
                             r.source = mic.clone();
@@ -144,7 +157,7 @@ fn main() -> Result<()> {
     };
 
     let mut event_loop: EventLoop<'static, Wl> = EventLoop::try_new()?;
-    match Wl::connect(event_loop.handle(), media.clone(), out.clone(), hostname.clone()) {
+    match Wl::connect(event_loop.handle(), media.clone(), out.clone(), hostname.clone(), presence.clone()) {
         Ok(mut wl) => {
             event_loop
                 .handle()
@@ -164,7 +177,7 @@ fn main() -> Result<()> {
                 hostname,
                 width: 0,
                 height: 0,
-                encoder: media.encoder.to_string(),
+                encoder: media.encoder().to_string(),
             });
             out.status(format!("screen: {e:#}"));
             let mut fallback: EventLoop<'static, bool> = EventLoop::try_new()?;
@@ -244,4 +257,20 @@ fn watch_devices(route: Arc<Mutex<Option<Route>>>, media: Arc<Media>, out: out::
         })
         .ok()?;
     Some(child)
+}
+
+/// One station per PC: an older one whose SSH session died can linger holding
+/// the camera, the overlay and the audio route. The newest connection wins.
+fn replace_older() {
+    let me = std::process::id().to_string();
+    let Ok(out) = std::process::Command::new("pgrep").args(["-x", "tutor-station"]).output() else { return };
+    let older: Vec<String> =
+        String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|p| *p != me).map(str::to_string).collect();
+    if older.is_empty() {
+        return;
+    }
+    let _ = std::process::Command::new("kill").args(&older).status();
+    // Let it tear down its audio route before we build ours.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    eprintln!("tutor-station: replaced older station {}", older.join(" "));
 }

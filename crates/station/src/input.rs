@@ -130,6 +130,14 @@ impl Injector {
         Ok(())
     }
 
+    /// Wake a sleeping display without typing anything: tap Shift.
+    pub fn wake(&mut self) -> Result<()> {
+        let shift = KeyCode::KEY_LEFTSHIFT.0;
+        self.keyboard.emit(&[InputEvent::new(EV_KEY, shift, 1)])?;
+        self.keyboard.emit(&[InputEvent::new(EV_KEY, shift, 0)])?;
+        Ok(())
+    }
+
     pub fn release_all(&mut self) -> Result<()> {
         for code in std::mem::take(&mut self.held_keys) {
             self.keyboard.emit(&[InputEvent::new(EV_KEY, code, 0)])?;

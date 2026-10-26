@@ -8,7 +8,7 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Bumped whenever a message changes shape.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 6;
 
 /// Largest frame either side accepts. A 3440x1440 keyframe is well under 2 MB.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -35,12 +35,19 @@ pub enum ToStation {
     SetOutput(String),
     /// Use this mic for their voice, by name.
     SetMic(String),
+    /// Wake their display (a harmless Shift tap).
+    Wake,
+    /// Answered with `Pong` carrying the same value, to time the round trip.
+    Ping(u64),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Streams {
     /// 0 pauses the screen.
     pub screen_fps: u8,
+    /// Divide their screen's width and height by this before encoding:
+    /// 1 full, 2 half, 3 a third. 0 is treated as 1.
+    pub screen_scale: u8,
     pub kid_cam: bool,
     pub kid_voice: bool,
     pub app_audio: bool,
@@ -48,6 +55,9 @@ pub struct Streams {
     pub dad_voice: bool,
     /// Show Dad's camera overlay on their screen.
     pub dad_cam: bool,
+    /// Where the overlay's centre goes, `0..=ABS_MAX` on each axis of their
+    /// screen; kept inside the screen. (0, 0) is the top-left corner.
+    pub dad_cam_at: (u16, u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +96,21 @@ pub enum FromStation {
     /// Their outputs and mics as (name, description), and the ones in use.
     /// Sent on connect and whenever a device comes, goes or is chosen.
     Devices { outputs: Vec<(String, String)>, output: String, mics: Vec<(String, String)>, mic: String },
+    /// Whether anyone can see their screen right now. Sent whenever it changes.
+    Presence(Presence),
+    /// Reply to `Ping`, with the screen frames dropped since the last one
+    /// because the link couldn't keep up.
+    Pong { t: u64, dropped: u32 },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Presence {
+    /// The lock screen is up.
+    pub locked: bool,
+    /// Their monitor is powered off (asleep).
+    pub display_off: bool,
+    /// No keyboard or mouse use on their PC for a minute.
+    pub idle: bool,
 }
 
 pub fn write_frame<T: Serialize>(w: &mut impl Write, msg: &T) -> io::Result<()> {

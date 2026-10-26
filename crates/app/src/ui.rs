@@ -10,17 +10,17 @@ use std::{
 };
 
 use anyhow::Result;
-use gtk4::{self as gtk, gdk, glib, pango, prelude::*};
-use tutor_proto::{ABS_MAX, Input, Streams, ToStation};
+use gtk4::{self as gtk, gdk, glib, graphene, pango, prelude::*};
+use tutor_proto::{ABS_MAX, Input, Presence, Streams, ToStation};
 
 use crate::{
     config::Config,
+    settings::{self, Settings, StationSettings},
     media::{self, Me, Paintables, Playback},
-    station::{Devices, Event, Station},
+    station::{Devices, Event, Link, Station},
 };
 
 /// Starting sidebar width; drag the divider to change it.
-const SIDEBAR: i32 = 360;
 const SELECTED_FPS: u8 = 30;
 const BACKGROUND_FPS: u8 = 5;
 /// evdev KEY_ESC, as GDK reports it (X keycode = evdev + 8).
@@ -38,7 +38,22 @@ struct View {
     /// "My cam" is remembered per PC.
     dad_cam: Cell<bool>,
     devices: RefCell<Devices>,
+    presence: Cell<Presence>,
+    link: Cell<Link>,
+    /// Where my cam sits on their screen (`Streams::dad_cam_at`), per PC.
+    dad_cam_at: Cell<(u16, u16)>,
+    /// Index into `QUALITIES`, remembered per PC.
+    quality: Cell<u32>,
 }
+
+/// Screen quality choices: label and the divisor for width and height;
+/// 0 stops capturing their screen at all, so their games lose nothing.
+const QUALITIES: [(&str, u8); 4] = [
+    ("Full — reading, homework", 1),
+    ("Half — playing together", 2),
+    ("Low — bad connection", 3),
+    ("Off — don't touch their FPS", 0),
+];
 
 struct Toggles {
     talk: gtk::ToggleButton,
@@ -61,11 +76,23 @@ struct Ui {
     /// Last pointer position over the screen view, in its own coordinates.
     pointer: Cell<(f64, f64)>,
     webcam: gtk::Picture,
-    banner: gtk::Label,
+    /// Over the screen view while offline, locked or asleep.
+    banner: gtk::Box,
+    banner_text: gtk::Label,
+    banner_wake: gtk::Button,
+    /// Bottom-right of the screen view: round trip, fps, bitrate; turns
+    /// amber when laggy and red when stalled.
+    health: gtk::Label,
     status: gtk::Label,
     output: gtk::DropDown,
     mic: gtk::DropDown,
+    quality: gtk::DropDown,
     toggles: Toggles,
+    paned: gtk::Paned,
+    /// Last written settings, to skip writes that change nothing.
+    saved: Rc<RefCell<Settings>>,
+    /// Newest settings waiting for the scheduled write.
+    pending: Rc<RefCell<Option<Settings>>>,
     /// Set while the UI updates toggles itself, so handlers ignore it.
     updating: Cell<bool>,
     held_keys: RefCell<BTreeSet<u16>>,
@@ -87,6 +114,7 @@ pub fn run(config: Config) -> Result<()> {
 }
 
 fn build(app: &gtk::Application, config: &Config) -> Result<()> {
+    let saved = settings::load();
     let speakers = media::find_device("sinks", &config.me.speakers);
     let mut stations = Vec::new();
     let mut paints = Vec::new();
@@ -126,20 +154,54 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
         .vexpand(true)
         .focusable(true)
         .build();
-    let banner = gtk::Label::builder().wrap(true).justify(gtk::Justification::Center).css_classes(["title-2"]).build();
+    let banner_text = gtk::Label::builder().wrap(true).justify(gtk::Justification::Center).css_classes(["title-2"]).build();
+    let banner_wake = gtk::Button::builder().label("🔓 Wake & unlock").halign(gtk::Align::Center).css_classes(["suggested-action", "pill"]).build();
+    let banner = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .css_classes(["osd", "card"])
+        .build();
+    banner.set_margin_top(16);
+    banner.set_margin_bottom(16);
+    banner.set_margin_start(16);
+    banner.set_margin_end(16);
+    banner.append(&banner_text);
+    banner.append(&banner_wake);
     // Scrolls only while zoomed in.
     let screen_scroll = gtk::ScrolledWindow::builder().child(&screen).hexpand(true).vexpand(true).build();
     let screen_box = gtk::Overlay::builder().child(&screen_scroll).build();
     screen_box.add_overlay(&banner);
+    let health = gtk::Label::builder()
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::End)
+        .css_classes(["osd", "health"])
+        .can_target(false)
+        .build();
+    health.set_margin_end(12);
+    health.set_margin_bottom(12);
+    screen_box.add_overlay(&health);
+    let css = gtk::CssProvider::new();
+    css.load_from_string(
+        ".health { padding: 4px 10px; border-radius: 999px; font-feature-settings: 'tnum'; }
+         .health.laggy { background: rgba(200, 130, 0, 0.9); color: white; font-weight: bold; }
+         .health.stalled { background: rgba(190, 30, 30, 0.92); color: white; font-weight: bold; font-size: 1.3em; }",
+    );
+    gtk::style_context_add_provider_for_display(
+        &gtk::prelude::WidgetExt::display(&health),
+        &css,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
 
     // Right: webcam, toggles, status, cards.
     let webcam = gtk::Picture::builder().content_fit(gtk::ContentFit::Contain).can_shrink(true).build();
     // Keeps the webcam 16:9 at whatever width the sidebar is dragged to.
     let webcam_frame = gtk::AspectFrame::builder().ratio(16.0 / 9.0).obey_child(false).child(&webcam).build();
     let toggles = Toggles {
-        talk: gtk::ToggleButton::builder().child(&short_label("🎙 Talk")).active(true).build(),
-        hear: gtk::ToggleButton::builder().child(&short_label("🔊 Hear apps")).active(true).build(),
-        cam: gtk::ToggleButton::builder().child(&short_label("📷 My cam")).build(),
+        talk: gtk::ToggleButton::builder().child(&short_label("🎙 Talk")).active(saved.talk).build(),
+        hear: gtk::ToggleButton::builder().child(&short_label("🔊 Hear apps")).active(saved.hear).build(),
+        cam: gtk::ToggleButton::builder().child(&short_label("📷 My cam")).tooltip_text("Your camera on their screen. Shift+drag on their screen to move it.").build(),
         control: gtk::ToggleButton::builder().child(&short_label("🖱 Control")).build(),
     };
     let grid = gtk::Grid::builder().row_spacing(6).column_spacing(6).column_homogeneous(true).build();
@@ -147,18 +209,23 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
     grid.attach(&toggles.hear, 1, 0, 1, 1);
     grid.attach(&toggles.cam, 0, 1, 1, 1);
     grid.attach(&toggles.control, 1, 1, 1, 1);
-    let unlock = gtk::Button::builder().child(&short_label("🔓 Unlock their screen")).build();
+    let unlock = gtk::Button::builder().child(&short_label("🔓 Wake & unlock their screen")).build();
     grid.attach(&unlock, 0, 2, 2, 1);
     let output = device_picker();
     output.set_hexpand(true);
     let mic = device_picker();
     mic.set_hexpand(true);
+    let quality = device_picker();
+    quality.set_model(Some(&gtk::StringList::new(&QUALITIES.map(|(label, _)| label))));
+    quality.set_hexpand(true);
     let pickers = gtk::Grid::builder().row_spacing(6).column_spacing(8).build();
     // Labels above the pickers, not beside them: keeps the sidebar narrow.
     pickers.attach(&short_label("Their sound on"), 0, 0, 1, 1);
     pickers.attach(&output, 0, 1, 1, 1);
     pickers.attach(&short_label("Their mic"), 0, 2, 1, 1);
     pickers.attach(&mic, 0, 3, 1, 1);
+    pickers.attach(&short_label("Their screen quality"), 0, 4, 1, 1);
+    pickers.attach(&quality, 0, 5, 1, 1);
     let shortcuts = shortcuts_button();
     let status = gtk::Label::builder().wrap(true).xalign(0.0).css_classes(["dim-label"]).build();
     let side = gtk::Box::builder()
@@ -195,6 +262,7 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
         row.append(&text);
         let card = gtk::Button::builder().child(&row).build();
         side.append(&card);
+        let ss = saved.stations.get(&station.config.name).cloned().unwrap_or_default();
         views.push(View {
             station: station.clone(),
             paint,
@@ -204,8 +272,12 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
             level,
             online: Cell::new(false),
             note: RefCell::new("connecting…".into()),
-            dad_cam: Cell::new(false),
+            dad_cam: Cell::new(ss.dad_cam),
             devices: RefCell::new(Devices::default()),
+            presence: Cell::new(Presence::default()),
+            link: Cell::new(Link::default()),
+            quality: Cell::new(ss.quality.min(QUALITIES.len() as u32 - 1)),
+            dad_cam_at: Cell::new(ss.dad_cam_at),
         });
     }
 
@@ -226,11 +298,12 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
         .shrink_end_child(true)
         .wide_handle(true)
         .build();
-    let placed = Cell::new(false);
+    let placed = Rc::new(Cell::new(false));
+    let (pl, sidebar) = (placed.clone(), saved.sidebar.max(0));
     root.connect_max_position_notify(move |p| {
-        if !placed.get() && p.max_position() > SIDEBAR * 2 {
-            placed.set(true);
-            p.set_position(p.max_position() - SIDEBAR);
+        if !pl.get() && p.max_position() > sidebar * 2 {
+            pl.set(true);
+            p.set_position(p.max_position() - sidebar);
         }
     });
     let window = gtk::ApplicationWindow::builder().application(app).title("Tutor").default_width(1600).default_height(900).child(&root).build();
@@ -239,8 +312,11 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
         views,
         me,
         selected: Cell::new(0),
-        talk: Cell::new(true),
-        hear: Cell::new(true),
+        talk: Cell::new(saved.talk),
+        hear: Cell::new(saved.hear),
+        paned: root.clone(),
+        saved: Rc::new(RefCell::new(saved.clone())),
+        pending: Rc::default(),
         control: Cell::new(false),
         screen,
         screen_scroll,
@@ -248,9 +324,13 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
         pointer: Cell::new((0.0, 0.0)),
         webcam,
         banner,
+        banner_text,
+        banner_wake,
+        health,
         status,
         output,
         mic,
+        quality,
         toggles,
         updating: Cell::new(false),
         held_keys: RefCell::new(BTreeSet::new()),
@@ -293,34 +373,41 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
         }
     });
     let u = ui.clone();
-    unlock.connect_clicked(move |_| {
-        let station = u.view().station.clone();
-        let (tx, rx) = async_channel::bounded(1);
-        std::thread::spawn(move || {
-            let _ = tx.send_blocking(station.unlock().map_err(|e| format!("{e:#}")));
-        });
-        let u = u.clone();
-        glib::spawn_future_local(async move {
-            let text = match rx.recv().await {
-                Ok(Ok(())) => "unlock sent".to_string(),
-                Ok(Err(e)) => format!("unlock failed: {e}"),
-                Err(_) => return,
-            };
-            u.status.set_text(&text);
-        });
+    ui.quality.connect_selected_notify(move |d| {
+        if u.updating.get() {
+            return;
+        }
+        u.view().quality.set(d.selected().min(QUALITIES.len() as u32 - 1));
+        u.sync();
+        u.refresh();
     });
+    let u = ui.clone();
+    unlock.connect_clicked(move |_| wake_unlock(&u));
+    let u = ui.clone();
+    ui.banner_wake.connect_clicked(move |_| wake_unlock(&u));
     wire_input(&ui);
     wire_view(&ui, &window, &shortcuts);
 
     let u = ui.clone();
     window.connect_close_request(move |_| {
+        let now = u.snapshot();
+        if *u.saved.borrow() != now {
+            settings::save(&now);
+        }
         for v in &u.views {
             v.station.stop();
         }
         glib::Propagation::Proceed
     });
 
-    ui.select(0);
+    // Only after the first placement, or the initial layout would overwrite the saved width.
+    let u = ui.clone();
+    root.connect_position_notify(move |_| {
+        if placed.get() {
+            u.save_soon();
+        }
+    });
+    ui.select(ui.views.iter().position(|v| v.station.config.name == saved.selected).unwrap_or(0));
     window.maximize();
     window.present();
     Ok(())
@@ -346,6 +433,7 @@ impl Ui {
         }
         self.updating.set(true);
         self.toggles.cam.set_active(v.dad_cam.get());
+        self.quality.set_selected(v.quality.get());
         self.updating.set(false);
         self.show_devices();
         self.sync();
@@ -353,24 +441,65 @@ impl Ui {
     }
 
     /// Push every station's wanted streams (see the switching table in the plan).
+    /// Settings as the window shows them now.
+    fn snapshot(&self) -> Settings {
+        Settings {
+            selected: self.view().station.config.name.clone(),
+            talk: self.talk.get(),
+            hear: self.hear.get(),
+            sidebar: self.paned.max_position() - self.paned.position(),
+            stations: self
+                .views
+                .iter()
+                .map(|v| {
+                    let s = StationSettings { quality: v.quality.get(), dad_cam: v.dad_cam.get(), dad_cam_at: v.dad_cam_at.get() };
+                    (v.station.config.name.clone(), s)
+                })
+                .collect(),
+        }
+    }
+
+    /// Write settings half a second after the last change (a cam drag changes them 60 times a second).
+    fn save_soon(&self) {
+        let armed = self.pending.borrow_mut().replace(self.snapshot()).is_some();
+        if armed {
+            return;
+        }
+        let (pending, saved) = (self.pending.clone(), self.saved.clone());
+        glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+            let Some(now) = pending.borrow_mut().take() else { return };
+            if *saved.borrow() != now {
+                settings::save(&now);
+                *saved.borrow_mut() = now;
+            }
+        });
+    }
+
     fn sync(&self) {
         let sel = self.selected.get();
         let mut any_cam = false;
         for (i, v) in self.views.iter().enumerate() {
             let is_sel = i == sel;
             v.station.set_streams(Streams {
-                screen_fps: if is_sel { SELECTED_FPS } else { BACKGROUND_FPS },
+                screen_fps: match QUALITIES[v.quality.get() as usize].1 {
+                    0 => 0,
+                    _ if is_sel => SELECTED_FPS,
+                    _ => BACKGROUND_FPS,
+                },
+                screen_scale: QUALITIES[v.quality.get() as usize].1.max(1),
                 kid_cam: is_sel,
                 kid_voice: true,
                 app_audio: is_sel && self.hear.get(),
                 dad_voice: is_sel && self.talk.get(),
                 dad_cam: v.dad_cam.get(),
+                dad_cam_at: v.dad_cam_at.get(),
             });
             any_cam |= v.dad_cam.get() && v.online.get();
         }
         if let Err(e) = self.me.set_camera(any_cam) {
             self.status.set_text(&format!("My camera: {e:#}"));
         }
+        self.save_soon();
     }
 
     /// Redraw labels from state.
@@ -392,21 +521,52 @@ impl Ui {
                 if i == sel && self.control.get() {
                     bits.push("you're driving".to_string());
                 }
+                let link = v.link.get();
+                if link.stalled() {
+                    bits.insert(0, "⚠ stalled".to_string());
+                } else if link.laggy() {
+                    bits.insert(0, "⚠ laggy".to_string());
+                }
+                let p = v.presence.get();
+                if p.display_off {
+                    bits.insert(0, "💤 screen asleep".to_string());
+                } else if p.locked {
+                    bits.insert(0, "🔒 locked".to_string());
+                } else if p.idle {
+                    bits.insert(0, "idle".to_string());
+                }
             }
             v.sub.set_text(&bits.join(" · "));
         }
         let v = self.view();
-        if v.online.get() {
-            self.banner.set_visible(false);
+        let name = &v.station.config.name;
+        let p = v.presence.get();
+        if !v.online.get() {
+            self.banner.set_visible(true);
+            self.banner_wake.set_visible(false);
+            self.banner_text.set_text(&format!("{name} is offline\n{}", v.note.borrow()));
+            self.status.set_text("");
+        } else if QUALITIES[v.quality.get() as usize].1 == 0 {
+            self.banner.set_visible(true);
+            self.banner_wake.set_visible(false);
+            self.banner_text.set_text(&format!(
+                "Screen sharing is off\n{name}'s games get every frame. Voice and webcam still work.\nPick a screen quality in the sidebar to see it again."
+            ));
+            self.status.set_text(&v.note.borrow());
+        } else if p.display_off || p.locked {
+            let what = if p.display_off { "💤 screen is asleep" } else { "🔒 screen is locked" };
+            self.banner.set_visible(true);
+            self.banner_wake.set_visible(true);
+            self.banner_text.set_text(&format!("Connected, but {name}'s {what}"));
             self.status.set_text(&v.note.borrow());
         } else {
-            self.banner.set_visible(true);
-            self.banner.set_text(&format!("{} is offline\n{}", v.station.config.name, v.note.borrow()));
-            self.status.set_text("");
+            self.banner.set_visible(false);
+            self.status.set_text(&v.note.borrow());
         }
         for t in [&self.toggles.hear, &self.toggles.cam, &self.toggles.control, &self.toggles.talk] {
             t.set_sensitive(v.online.get());
         }
+        self.show_health();
     }
 
     fn on_event(&self, i: usize, ev: Event) {
@@ -418,6 +578,7 @@ impl Ui {
                 self.sync();
             }
             Event::Offline(reason) => {
+                v.presence.set(Presence::default());
                 v.online.set(false);
                 v.level.set_value(0.0);
                 *v.note.borrow_mut() = format!("{reason} · retrying");
@@ -427,6 +588,7 @@ impl Ui {
                 self.sync();
             }
             Event::Status(s) => *v.note.borrow_mut() = s,
+            Event::Presence(p) => v.presence.set(p),
             Event::Devices(d) => {
                 *v.devices.borrow_mut() = d;
                 if i == self.selected.get() {
@@ -438,8 +600,39 @@ impl Ui {
                 v.level.set_value(l);
                 return;
             }
+            Event::Link(link) => {
+                let changed = link.laggy() != v.link.get().laggy() || link.stalled() != v.link.get().stalled();
+                v.link.set(link);
+                if i == self.selected.get() {
+                    self.show_health();
+                }
+                if !changed {
+                    return;
+                }
+            }
         }
         self.refresh();
+    }
+
+    /// The health pill for the selected station.
+    fn show_health(&self) {
+        let v = self.view();
+        let h = &self.health;
+        h.set_visible(v.online.get());
+        let l = v.link.get();
+        h.remove_css_class("laggy");
+        h.remove_css_class("stalled");
+        let text = if l.stalled() {
+            h.add_css_class("stalled");
+            format!("⚠ Stalled — nothing from them for {:.1} s", l.silent_ms as f64 / 1000.0)
+        } else if l.laggy() {
+            h.add_css_class("laggy");
+            let why = if l.dropped > 0 { format!(" · {} frames dropped", l.dropped) } else { String::new() };
+            format!("⚠ Laggy: {} ms{why}", l.rtt_ms)
+        } else {
+            format!("● {} ms · {} fps · {:.1} Mb/s", l.rtt_ms, l.fps, l.kbps as f64 / 1000.0)
+        };
+        h.set_text(&text);
     }
 
     /// Fill the output and mic pickers from the selected station's devices.
@@ -670,12 +863,27 @@ fn wire_input(ui: &Rc<Ui>) {
 fn wire_view(ui: &Rc<Ui>, window: &gtk::ApplicationWindow, shortcuts: &gtk::MenuButton) {
     let drag = gtk::GestureDrag::new();
     let start = Rc::new(Cell::new((0.0, 0.0)));
-    let (u, st) = (ui.clone(), start.clone());
-    drag.connect_drag_begin(move |_, _, _| {
+    // Shift+drag moves my cam on their screen instead of panning.
+    let moving_cam = Rc::new(Cell::new(false));
+    let (u, st, mc) = (ui.clone(), start.clone(), moving_cam.clone());
+    drag.connect_drag_begin(move |g, _, _| {
+        mc.set(!u.control.get() && g.current_event_state().contains(gdk::ModifierType::SHIFT_MASK));
         st.set((u.screen_scroll.hadjustment().value(), u.screen_scroll.vadjustment().value()));
     });
     let u = ui.clone();
-    drag.connect_drag_update(move |_, dx, dy| {
+    drag.connect_drag_update(move |g, dx, dy| {
+        if moving_cam.get() {
+            let Some((x0, y0)) = g.start_point() else { return };
+            let Some(p) = u.screen_scroll.compute_point(&u.screen, &graphene::Point::new((x0 + dx) as f32, (y0 + dy) as f32))
+            else {
+                return;
+            };
+            if let Some(at) = u.to_abs(p.x() as f64, p.y() as f64) {
+                u.view().dad_cam_at.set(at);
+                u.sync();
+            }
+            return;
+        }
         if u.control.get() || u.zoom.get() <= 1.0 {
             return;
         }
@@ -753,7 +961,8 @@ fn device_picker() -> gtk::DropDown {
 }
 
 /// Every key and mouse trick, one click (or F1) away.
-const SHORTCUTS: [(&str, &str); 10] = [
+const SHORTCUTS: [(&str, &str); 11] = [
+    ("Shift + drag", "Move your cam on their screen (My cam on)"),
     ("Ctrl + scroll", "Zoom in/out on their screen (always)"),
     ("Drag", "Pan while zoomed"),
     ("Double-click", "Fit their whole screen"),
@@ -791,4 +1000,23 @@ fn shortcuts_button() -> gtk::MenuButton {
         .child(&short_label("⌨ Shortcuts (F1)"))
         .popover(&gtk::Popover::builder().child(&grid).build())
         .build()
+}
+
+/// Wake their display and dismiss the lock screen (logind, no password).
+fn wake_unlock(ui: &Rc<Ui>) {
+    let station = ui.view().station.clone();
+    station.send(ToStation::Wake);
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(station.unlock().map_err(|e| format!("{e:#}")));
+    });
+    let u = ui.clone();
+    glib::spawn_future_local(async move {
+        let text = match rx.recv().await {
+            Ok(Ok(())) => "woke and unlocked".to_string(),
+            Ok(Err(e)) => format!("unlock failed: {e}"),
+            Err(_) => return,
+        };
+        u.status.set_text(&text);
+    });
 }

@@ -2,7 +2,14 @@
 //! Voice and status jump the queue; video and camera frames are dropped
 //! instead of queued when SSH can't keep up, so latency never builds.
 
-use std::{io, thread};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    thread,
+};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased};
 use tutor_proto::{FromStation, write_frame};
@@ -12,23 +19,38 @@ pub struct Out {
     prio: Sender<FromStation>,
     video: Sender<FromStation>,
     cam: Sender<FromStation>,
+    dropped: Arc<AtomicU32>,
+    last_status: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl Out {
+    /// Screen frames dropped since the last call.
+    pub fn take_dropped(&self) -> u32 {
+        self.dropped.swap(0, Ordering::Relaxed)
+    }
+
     /// Audio and status. Only dropped if the pipe has been stuck for seconds.
     pub fn send(&self, msg: FromStation) {
         let _ = self.prio.try_send(msg);
     }
 
+    /// Repeats of the last message are dropped.
     pub fn status(&self, text: impl Into<String>) {
         let text = text.into();
+        if self.last_status.lock().unwrap().replace(text.clone()).as_deref() == Some(text.as_str()) {
+            return;
+        }
         eprintln!("tutor-station: {text}");
         self.send(FromStation::Status(text));
     }
 
     /// False when the frame was dropped; the caller must restart from a keyframe.
     pub fn video(&self, msg: FromStation) -> bool {
-        !matches!(self.video.try_send(msg), Err(TrySendError::Full(_)))
+        let full = matches!(self.video.try_send(msg), Err(TrySendError::Full(_)));
+        if full {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        !full
     }
 
     pub fn cam(&self, msg: FromStation) {
@@ -48,7 +70,7 @@ pub fn spawn() -> (Out, thread::JoinHandle<()>) {
             }
         })
         .expect("spawn writer");
-    (Out { prio, video, cam }, handle)
+    (Out { prio, video, cam, dropped: Arc::default(), last_status: Arc::default() }, handle)
 }
 
 fn write_loop(
