@@ -8,13 +8,16 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Bumped whenever a message changes shape.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 /// Largest frame either side accepts. A 3440x1440 keyframe is well under 2 MB.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// Voice and app audio: raw signed 16-bit little-endian PCM at this rate.
 pub const AUDIO_RATE: u32 = 48_000;
+
+/// Both webcams (theirs and Dad's) send 640x360 JPEGs at this rate.
+pub const CAM_FPS: u32 = 10;
 
 /// Absolute pointer coordinates span `0..=ABS_MAX` across the kid's screen.
 pub const ABS_MAX: u16 = u16::MAX;
@@ -99,8 +102,8 @@ pub enum FromStation {
     /// Whether anyone can see their screen right now. Sent whenever it changes.
     Presence(Presence),
     /// Reply to `Ping`, with the screen frames dropped since the last one
-    /// because the link couldn't keep up.
-    Pong { t: u64, dropped: u32 },
+    /// because the link couldn't keep up, and the station's resident memory.
+    Pong { t: u64, dropped: u32, rss_kb: u32 },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +114,14 @@ pub struct Presence {
     pub display_off: bool,
     /// No keyboard or mouse use on their PC for a minute.
     pub idle: bool,
+}
+
+/// This process's resident memory, from `/proc/self/status`; 0 if unreadable.
+pub fn rss_kb() -> u32 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("VmRSS:")?.trim().strip_suffix("kB")?.trim().parse().ok()))
+        .unwrap_or(0)
 }
 
 pub fn write_frame<T: Serialize>(w: &mut impl Write, msg: &T) -> io::Result<()> {
@@ -150,6 +161,11 @@ mod tests {
         assert!(matches!(read_frame(&mut r).unwrap(), Some(ToStation::Input(Input::Move { x: 1, y: ABS_MAX }))));
         assert!(matches!(read_frame(&mut r).unwrap(), Some(ToStation::Streams(Streams { screen_fps: 30, dad_cam: true, .. }))));
         assert!(read_frame::<ToStation>(&mut r).unwrap().is_none());
+    }
+
+    #[test]
+    fn rss_is_read() {
+        assert!(rss_kb() > 0);
     }
 
     #[test]

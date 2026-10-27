@@ -7,5 +7,6 @@ mod station;
 mod ui;
 
 fn main() -> anyhow::Result<()> {
+    tutor_telemetry::init("tutor");
     ui::run(config::load()?)
 }

@@ -13,7 +13,7 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use smithay_client_toolkit::reexports::calloop::channel::Sender;
-use tutor_proto::{FromStation, Streams};
+use tutor_proto::{CAM_FPS, FromStation, Streams};
 
 use crate::{audio_route::APP_SINK, out::Out, wayland::LoopMsg};
 
@@ -81,6 +81,7 @@ impl Media {
 
     pub fn apply(&self, next: Streams) {
         let prev = std::mem::replace(&mut *self.streams.lock().unwrap(), next);
+        tracing::debug!(?next, "streams.applied");
         if prev.screen_fps != next.screen_fps {
             let _ = self.loop_tx.send(LoopMsg::Fps(next.screen_fps));
             if next.screen_fps == 0 {
@@ -301,14 +302,14 @@ impl Media {
         );
         let src = app_src(&pipeline)?;
         let pipeline = self.play(pipeline, "screen")?;
-        eprintln!("tutor-station: screen {width}x{height} sent at 1/{scale} size, {kbps} kbit/s");
+        tracing::info!(width, height, scale, kbps, encoder = self.encoder(), "screen.encoder_started");
         Ok(Screen { pipeline, src, sink, size: (width, height), format, scale })
     }
 
     fn build_kid_cam(&self) -> Result<gst::Pipeline> {
         let pipeline = launch(&format!(
             "v4l2src device=\"{}\" ! image/jpeg,width=640,height=360,framerate=30/1 \
-             ! videorate drop-only=true ! image/jpeg,framerate=15/1 \
+             ! videorate drop-only=true ! image/jpeg,framerate={CAM_FPS}/1 \
              ! appsink name=sink sync=false max-buffers=2 drop=true",
             self.camera
         ))?;

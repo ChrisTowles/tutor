@@ -22,7 +22,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use smithay_client_toolkit::reexports::calloop::{EventLoop, channel};
-use tutor_proto::{FromStation, ToStation, VERSION, read_frame};
+use tutor_proto::{FromStation, ToStation, VERSION, read_frame, rss_kb};
 
 use crate::{
     audio_route::Route,
@@ -77,11 +77,13 @@ fn session_env() {
 }
 
 fn main() -> Result<()> {
+    tutor_telemetry::init("tutor-station");
     replace_older();
     session_env();
     let args = parse_args()?;
     gstreamer::init()?;
     let hostname = fs::read_to_string("/etc/hostname").unwrap_or_default().trim().to_string();
+    tracing::info!(headset = %args.headset, camera = %args.camera, "station.started");
 
     let (out, writer) = out::spawn();
     let route = Arc::new(Mutex::new(Route::setup(&args.headset).map_err(|e| out.status(format!("audio: {e:#}"))).ok()));
@@ -118,7 +120,7 @@ fn main() -> Result<()> {
                     Ok(Some(ToStation::DadVoice(pcm))) => media.dad_voice(pcm),
                     Ok(Some(ToStation::DadCam(jpeg))) => media.dad_cam(jpeg),
                     Ok(Some(ToStation::Keyframe)) => media.force_keyframe(),
-                    Ok(Some(ToStation::Ping(t))) => out.send(FromStation::Pong { t, dropped: out.take_dropped() }),
+                    Ok(Some(ToStation::Ping(t))) => out.send(FromStation::Pong { t, dropped: out.take_dropped(), rss_kb: rss_kb() }),
                     Ok(Some(ToStation::Wake)) => {
                         if let Some(inj) = &mut injector
                             && let Err(e) = inj.wake()
@@ -144,7 +146,7 @@ fn main() -> Result<()> {
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        eprintln!("tutor-station: stdin: {e}");
+                        tracing::warn!(error = %e, "stdin.failed");
                         break;
                     }
                 }
@@ -205,6 +207,7 @@ fn main() -> Result<()> {
     let _ = reader.join();
     drop((out, media, loop_tx, route));
     let _ = writer.join();
+    tracing::info!("station.stopped");
     Ok(())
 }
 
@@ -240,16 +243,16 @@ fn watch_devices(route: Arc<Mutex<Option<Route>>>, media: Arc<Media>, out: out::
                             if let Some(sink) = sink
                                 && r.set_sink(&sink).is_ok()
                             {
-                                eprintln!("tutor-station: output now {sink}");
+                                tracing::info!(%sink, "output.changed");
                                 media.set_sink(&sink);
                             }
                             if let Some(source) = source {
-                                eprintln!("tutor-station: mic now {source}");
+                                tracing::info!(%source, "mic.changed");
                                 r.source = source.clone();
                                 media.set_source(&source);
                             }
                         }
-                        Err(e) => eprintln!("tutor-station: devices: {e:#}"),
+                        Err(e) => tracing::warn!(error = format!("{e:#}"), "devices.failed"),
                     }
                 }
                 send_devices(&out, &route);
@@ -272,5 +275,5 @@ fn replace_older() {
     let _ = std::process::Command::new("kill").args(&older).status();
     // Let it tear down its audio route before we build ours.
     std::thread::sleep(std::time::Duration::from_millis(1500));
-    eprintln!("tutor-station: replaced older station {}", older.join(" "));
+    tracing::info!(pids = older.join(" "), "station.replaced_older");
 }

@@ -18,8 +18,9 @@ The design and the decisions behind it are in [docs/plan.html](docs/plan.html); 
 Needs `libgtk-4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev` on this PC.
 
 ```bash
-cargo build --release
-./target/release/tutor            # or: cargo install --path crates/app && cargo install --path crates/station
+just run                          # builds both binaries, then starts tutor
+just build                        # build only
+# or: cargo install --path crates/app && cargo install --path crates/station
 ```
 
 Both binaries must sit in the same directory: `tutor` deploys the `tutor-station` next to it.
@@ -44,6 +45,24 @@ camera = "/dev/video0"
 `~/.config/tutor/settings.toml` is written by the app and remembers the last layout: which PC was on screen, Talk,
 Hear apps, sidebar width, and per PC the screen quality and where your cam sits. Delete it to reset.
 
+## Event log
+
+Both binaries log through `tracing` (`crates/telemetry`): to stderr, and to `~/.local/share/tutor/telemetry/events-<date>.jsonl`
+on the PC they run on, one JSON object per line, UTC days, 14 kept. `just events` follows today's log on this PC.
+`RUST_LOG` only changes stderr; the file always gets our crates at `debug`. `TUTOR_TELEMETRY=0` turns the file off.
+
+The rules, so the log can answer questions later without a live repro:
+
+- **Every user action emits a `ui.action` event** with a stable `action` id (`talk`, `select`, `quality`, `timer_stop`, …),
+  the `station` it applies to, and the outcome fields that matter (`on`, `seconds`, `device`).
+- **Every change the app didn't make itself is an event named for what changed**, `noun.verb`: `station.connected`,
+  `station.disconnected`, `link.lag` / `link.ok`, `station.deployed`, `audio.routed`. A panic is an `app.crash` record.
+- **Never log content or continuous input**: no keystrokes, mouse moves, zoom steps, audio or frames. `TUTOR_LINK_LOG=1`
+  adds the twice-a-second `link.sample` when you need it.
+
+```bash
+jq -c 'select(.message == "ui.action" and .action == "timer_stop") | {ts, seconds}' ~/.local/share/tutor/telemetry/events-*.jsonl
+```
 
 ## Each kid's PC needs
 

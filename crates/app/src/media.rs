@@ -8,6 +8,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gtk4::gdk;
+use tutor_proto::CAM_FPS;
 
 const VOICE_CAPS: &str = "audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved";
 const APP_CAPS: &str = "audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved";
@@ -139,7 +140,7 @@ impl Me {
             (true, false) => {
                 let p = launch(&format!(
                     "v4l2src device=\"{}\" ! image/jpeg,width=640,height=360,framerate=30/1 \
-                     ! videorate drop-only=true ! image/jpeg,framerate=15/1 \
+                     ! videorate drop-only=true ! image/jpeg,framerate={CAM_FPS}/1 \
                      ! appsink name=sink sync=false max-buffers=2 drop=true",
                     self.camera_device
                 ))?;

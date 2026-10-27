@@ -1,0 +1,15 @@
+[package]
+name = "tutor-telemetry"
+description = "tracing subscriber for tutor and tutor-station: stderr plus a JSONL event log on disk"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde_json = "1"
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tempfile = "3"

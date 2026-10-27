@@ -42,7 +42,7 @@ fn path() -> PathBuf {
 pub fn load() -> Settings {
     let Ok(text) = fs::read_to_string(path()) else { return Settings::default() };
     toml::from_str(&text).unwrap_or_else(|e| {
-        eprintln!("tutor: ignoring {}: {e}", path().display());
+        tracing::warn!(path = %path().display(), error = %e, "settings.ignored");
         Settings::default()
     })
 }
@@ -50,13 +50,13 @@ pub fn load() -> Settings {
 pub fn save(settings: &Settings) {
     let body = match toml::to_string(settings) {
         Ok(b) => b,
-        Err(e) => return eprintln!("tutor: settings: {e}"),
+        Err(e) => return tracing::warn!(error = %e, "settings.encode_failed"),
     };
     let path = path();
     let tmp = path.with_extension("toml.tmp");
     let text = format!("# Written by tutor whenever you change something; edit tutor.toml instead.\n{body}");
     if let Err(e) = fs::write(&tmp, text).and_then(|()| fs::rename(&tmp, &path)) {
-        eprintln!("tutor: save {}: {e}", path.display());
+        tracing::warn!(path = %path.display(), error = %e, "settings.save_failed");
     }
 }
 

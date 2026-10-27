@@ -67,7 +67,7 @@ pub fn load() -> Result<Config> {
     if !path.exists() {
         fs::create_dir_all(path.parent().unwrap())?;
         fs::write(&path, STARTER)?;
-        eprintln!("tutor: wrote starter config {}", path.display());
+        tracing::info!(path = %path.display(), "config.created");
     }
     let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let config: Config = toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
