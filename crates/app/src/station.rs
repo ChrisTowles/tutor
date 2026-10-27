@@ -17,7 +17,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
 use sha2::{Digest, Sha256};
-use tutor_proto::{Presence, FromStation, ToStation, VERSION, Streams, read_frame, write_frame};
+use tutor_proto::{Presence, FromStation, ToStation, VERSION, Streams, read_frame, rss_kb, write_frame};
 
 use crate::{config::StationConfig, media::Playback};
 
@@ -48,9 +48,18 @@ pub struct Link {
     /// How long since the last reply.
     pub silent_ms: u32,
     pub fps: u32,
+    /// Their screen coming in.
     pub kbps: u32,
+    /// Their webcam coming in.
+    pub cam_kbps: u32,
+    /// My webcam going out to them.
+    pub my_cam_kbps: u32,
     /// Screen frames the station dropped since the last report.
     pub dropped: u32,
+    /// Resident memory of `tutor-station` on their PC.
+    pub their_rss_mb: u32,
+    /// Resident memory of this `tutor` process (every station together).
+    pub my_rss_mb: u32,
 }
 
 impl Link {
@@ -68,7 +77,10 @@ impl Link {
 struct Stats {
     frames: AtomicU32,
     bytes: AtomicU64,
+    cam_bytes: AtomicU64,
+    my_cam_bytes: AtomicU64,
     dropped: AtomicU32,
+    their_rss_kb: AtomicU32,
     rtt_us: AtomicU64,
     /// Microseconds since `Station::epoch` of the last pong.
     pong_at: AtomicU64,
@@ -119,10 +131,19 @@ impl Station {
 
     /// Dropped while offline or when SSH is backed up.
     pub fn send(&self, msg: ToStation) {
-        if self.online()
-            && let Err(TrySendError::Full(_)) = self.tx.try_send(msg)
-        {
-            eprintln!("tutor: {} send queue full", self.config.name);
+        if !self.online() {
+            return;
+        }
+        let cam_len = match &msg {
+            ToStation::DadCam(jpeg) => jpeg.len() as u64,
+            _ => 0,
+        };
+        match self.tx.try_send(msg) {
+            Ok(()) => {
+                self.stats.my_cam_bytes.fetch_add(cam_len, Ordering::Relaxed);
+            }
+            Err(TrySendError::Full(_)) => tracing::warn!(station = %self.config.name, "station.send_queue_full"),
+            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 
@@ -152,6 +173,7 @@ impl Station {
                     if me.stopping.load(Ordering::Relaxed) {
                         break;
                     }
+                    tracing::warn!(station = %me.config.name, %reason, "station.disconnected");
                     let _ = events.send_blocking(Event::Offline(reason));
                     thread::sleep(RETRY);
                 }
@@ -255,20 +277,27 @@ impl Station {
                 }
                 let secs = last.elapsed().as_secs_f64().max(0.001);
                 last = Instant::now();
+                let kbps = |bytes: &AtomicU64| (bytes.swap(0, Ordering::Relaxed) as f64 * 8.0 / 1000.0 / secs) as u32;
                 let link = Link {
                     rtt_ms: (me.stats.rtt_us.load(Ordering::Relaxed) / 1000) as u32,
                     silent_ms: (now.saturating_sub(pong_at) / 1000) as u32,
                     fps: (me.stats.frames.swap(0, Ordering::Relaxed) as f64 / secs).round() as u32,
-                    kbps: (me.stats.bytes.swap(0, Ordering::Relaxed) as f64 * 8.0 / 1000.0 / secs) as u32,
+                    kbps: kbps(&me.stats.bytes),
+                    cam_kbps: kbps(&me.stats.cam_bytes),
+                    my_cam_kbps: kbps(&me.stats.my_cam_bytes),
                     dropped: me.stats.dropped.swap(0, Ordering::Relaxed),
+                    their_rss_mb: me.stats.their_rss_kb.load(Ordering::Relaxed) / 1024,
+                    my_rss_mb: rss_kb() / 1024,
                 };
-                // A log line per lag episode, for working out what caused it later.
+                // An event per lag episode, for working out what caused it later.
                 if link.laggy() != was_laggy {
                     was_laggy = link.laggy();
-                    eprintln!("tutor: {} {} {link:?}", me.config.name, if was_laggy { "LAG" } else { "ok again" });
+                    let name = if was_laggy { "link.lag" } else { "link.ok" };
+                    tracing::warn!(station = %me.config.name, rtt_ms = link.rtt_ms, silent_ms = link.silent_ms, dropped = link.dropped, "{name}");
                 }
+                // Two a second per PC: too many for the log unless asked for.
                 if std::env::var_os("TUTOR_LINK_LOG").is_some() {
-                    eprintln!("link {} {link:?}", me.config.name);
+                    tracing::info!(station = %me.config.name, ?link, "link.sample");
                 }
                 let _ = events.try_send(Event::Link(link));
             }
@@ -284,7 +313,7 @@ impl Station {
                     if version != VERSION {
                         bail!("station speaks v{version}, tutor v{VERSION}");
                     }
-                    eprintln!("tutor: {} up: {hostname} {width}x{height} via {encoder}", self.config.name);
+                    tracing::info!(station = %self.config.name, %hostname, width, height, %encoder, "station.connected");
                     self.online.store(true, Ordering::Relaxed);
                     // Toggles changed between connecting and now would otherwise be lost.
                     let _ = self.tx.try_send(ToStation::Streams(self.streams()));
@@ -295,13 +324,17 @@ impl Station {
                     self.stats.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
                     self.playback.video(data)
                 }
-                FromStation::Pong { t, dropped } => {
+                FromStation::Pong { t, dropped, rss_kb } => {
                     let now = self.now_us();
                     self.stats.rtt_us.store(now.saturating_sub(t), Ordering::Relaxed);
                     self.stats.pong_at.store(now, Ordering::Relaxed);
                     self.stats.dropped.fetch_add(dropped, Ordering::Relaxed);
+                    self.stats.their_rss_kb.store(rss_kb, Ordering::Relaxed);
                 }
-                FromStation::KidCam(jpeg) => self.playback.cam(jpeg),
+                FromStation::KidCam(jpeg) => {
+                    self.stats.cam_bytes.fetch_add(jpeg.len() as u64, Ordering::Relaxed);
+                    self.playback.cam(jpeg)
+                }
                 FromStation::KidVoice(pcm) => {
                     if let Some(l) = level.feed(&pcm) {
                         let _ = events.try_send(Event::Level(l));
@@ -319,7 +352,7 @@ impl Station {
                 FromStation::Status(s) if last_status.as_deref() == Some(s.as_str()) => {}
                 FromStation::Status(s) => {
                     last_status = Some(s.clone());
-                    eprintln!("tutor: {}: {s}", self.config.name);
+                    tracing::warn!(station = %self.config.name, status = %s, "station.status");
                     let _ = events.send_blocking(Event::Status(s));
                 }
             }
@@ -384,8 +417,9 @@ fn deploy(host: &str) -> Result<()> {
     if String::from_utf8_lossy(&remote.stdout).split_whitespace().next() == Some(local.as_str()) {
         return Ok(());
     }
-    eprintln!("tutor: installing tutor-station on {host}");
-    copy_to(host, &bin)
+    copy_to(host, &bin)?;
+    tracing::info!(%host, sha256 = %local, "station.deployed");
+    Ok(())
 }
 
 fn copy_to(host: &str, bin: &Path) -> Result<()> {

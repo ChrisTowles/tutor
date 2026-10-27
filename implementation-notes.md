@@ -99,3 +99,15 @@ Running log while building against [docs/plan.html](docs/plan.html).
 - **"Off" screen quality.** Stops screen capture (fps 0) and tears down the encoder so a game keeps every frame and
   its GPU memory; voice, webcam and Dad's cam keep running. The screen view shows a "Screen sharing is off" banner.
   Turning it back on re-probes NVENC, since the GPU may have room again.
+- **Webcams at 10 fps, and the pill shows what they cost.** Both webcams dropped from 15 to 10 fps (`CAM_FPS` in
+  `tutor-proto`). Protocol v7 adds `rss_kb` to `Pong`. The health pill now reads
+  "● 3 ms · 30 fps · screen 2.1 Mb/s · cam 1.2 in, 0.8 out" over "memory: theirs 180 MB · tutor 420 MB": their
+  webcam in, my webcam out to that PC, `tutor-station`'s resident memory there and this `tutor`'s here. The memory
+  figures are whole processes, since GStreamer can't give a per-pipeline number.
+- **Session timer.** A "⏱ Start timer" button under Wake & unlock: click to start from 0:00, click to stop, and it
+  keeps showing "Took 42:10" until the next start. One timer for the whole window, not per PC; not saved.
+- **Event log, modelled on towles-tool's telemetry.** New `tutor-telemetry` crate: a `tracing` subscriber with a
+  stderr layer and a JSONL event-log layer (spans written on close with `duration_ms`, daily files, 14 kept, panic
+  hook → `app.crash`). Writer only: towles-tool's reader, Attention and Rules screens aren't ported, `jq` covers it
+  for now. Every `eprintln!` in both binaries became a named event. The station logs on the kid's PC; its stderr
+  still reaches Dad's terminal through SSH.

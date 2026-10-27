@@ -52,7 +52,7 @@ impl Route {
                 let _ = pactl(&["move-sink-input", &input.id, APP_SINK]);
             }
         }
-        eprintln!("tutor-station: apps -> {APP_SINK} -> {}; mic {}", route.sink, route.source);
+        tracing::info!(apps = APP_SINK, sink = %route.sink, source = %route.source, "audio.routed");
         Ok(route)
     }
 
@@ -118,7 +118,7 @@ impl Route {
             }
         }
         unload_app_sink();
-        eprintln!("tutor-station: audio back on {}", self.sink);
+        tracing::info!(sink = %self.sink, "audio.restored");
     }
 }
 

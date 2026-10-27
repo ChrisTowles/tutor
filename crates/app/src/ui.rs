@@ -105,7 +105,7 @@ pub fn run(config: Config) -> Result<()> {
     let app = gtk::Application::builder().application_id("dev.towles.Tutor").build();
     app.connect_activate(move |app| {
         if let Err(e) = build(app, &config) {
-            eprintln!("tutor: {e:#}");
+            tracing::error!(error = format!("{e:#}"), "app.start_failed");
             app.quit();
         }
     });
@@ -211,6 +211,7 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
     grid.attach(&toggles.control, 1, 1, 1, 1);
     let unlock = gtk::Button::builder().child(&short_label("🔓 Wake & unlock their screen")).build();
     grid.attach(&unlock, 0, 2, 2, 1);
+    grid.attach(&stopwatch(), 0, 3, 2, 1);
     let output = device_picker();
     output.set_hexpand(true);
     let mic = device_picker();
@@ -339,7 +340,10 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
 
     for (i, v) in ui.views.iter().enumerate() {
         let u = ui.clone();
-        v.card.connect_clicked(move |_| u.select(i));
+        v.card.connect_clicked(move |_| {
+            tracing::info!(action = "select", station = %u.views[i].station.config.name, "ui.action");
+            u.select(i)
+        });
         let (tx, rx) = async_channel::unbounded();
         v.station.start(tx);
         let u = ui.clone();
@@ -358,6 +362,7 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
         let v = u.view();
         let name = v.devices.borrow().outputs.get(d.selected() as usize).map(|(n, _)| n.clone());
         if let Some(name) = name {
+            tracing::info!(action = "their_output", station = %v.station.config.name, device = %name, "ui.action");
             v.station.send(ToStation::SetOutput(name));
         }
     });
@@ -369,6 +374,7 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
         let v = u.view();
         let name = v.devices.borrow().mics.get(d.selected() as usize).map(|(n, _)| n.clone());
         if let Some(name) = name {
+            tracing::info!(action = "their_mic", station = %v.station.config.name, device = %name, "ui.action");
             v.station.send(ToStation::SetMic(name));
         }
     });
@@ -377,7 +383,9 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
         if u.updating.get() {
             return;
         }
-        u.view().quality.set(d.selected().min(QUALITIES.len() as u32 - 1));
+        let q = d.selected().min(QUALITIES.len() as u32 - 1);
+        tracing::info!(action = "quality", station = %u.view().station.config.name, quality = QUALITIES[q as usize].0, "ui.action");
+        u.view().quality.set(q);
         u.sync();
         u.refresh();
     });
@@ -390,6 +398,7 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
 
     let u = ui.clone();
     window.connect_close_request(move |_| {
+        tracing::info!("app.closed");
         let now = u.snapshot();
         if *u.saved.borrow() != now {
             settings::save(&now);
@@ -410,6 +419,7 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
     ui.select(ui.views.iter().position(|v| v.station.config.name == saved.selected).unwrap_or(0));
     window.maximize();
     window.present();
+    tracing::info!(stations = ui.views.len(), "app.started");
     Ok(())
 }
 
@@ -630,7 +640,17 @@ impl Ui {
             let why = if l.dropped > 0 { format!(" · {} frames dropped", l.dropped) } else { String::new() };
             format!("⚠ Laggy: {} ms{why}", l.rtt_ms)
         } else {
-            format!("● {} ms · {} fps · {:.1} Mb/s", l.rtt_ms, l.fps, l.kbps as f64 / 1000.0)
+            let mbps = |kbps: u32| kbps as f64 / 1000.0;
+            format!(
+                "● {} ms · {} fps · screen {:.1} Mb/s · cam {:.1} in, {:.1} out\nmemory: theirs {} MB · tutor {} MB",
+                l.rtt_ms,
+                l.fps,
+                mbps(l.kbps),
+                mbps(l.cam_kbps),
+                mbps(l.my_cam_kbps),
+                l.their_rss_mb,
+                l.my_rss_mb
+            )
         };
         h.set_text(&text);
     }
@@ -654,6 +674,7 @@ impl Ui {
         if self.control.get() == on {
             return;
         }
+        tracing::info!(action = "control", station = %self.view().station.config.name, on, "ui.action");
         self.control.set(on);
         self.updating.set(true);
         self.toggles.control.set_active(on);
@@ -724,6 +745,7 @@ fn wire_toggles(ui: &Rc<Ui>) {
     let u = ui.clone();
     ui.toggles.talk.connect_toggled(move |b| {
         if !u.updating.get() {
+            tracing::info!(action = "talk", on = b.is_active(), "ui.action");
             u.talk.set(b.is_active());
             u.sync();
             u.refresh();
@@ -732,6 +754,7 @@ fn wire_toggles(ui: &Rc<Ui>) {
     let u = ui.clone();
     ui.toggles.hear.connect_toggled(move |b| {
         if !u.updating.get() {
+            tracing::info!(action = "hear_apps", on = b.is_active(), "ui.action");
             u.hear.set(b.is_active());
             u.sync();
         }
@@ -739,6 +762,7 @@ fn wire_toggles(ui: &Rc<Ui>) {
     let u = ui.clone();
     ui.toggles.cam.connect_toggled(move |b| {
         if !u.updating.get() {
+            tracing::info!(action = "my_cam", station = %u.view().station.config.name, on = b.is_active(), "ui.action");
             u.view().dad_cam.set(b.is_active());
             u.sync();
             u.refresh();
@@ -912,10 +936,14 @@ fn wire_view(ui: &Rc<Ui>, window: &gtk::ApplicationWindow, shortcuts: &gtk::Menu
         match key {
             gdk::Key::F11 => {
                 if let Some(w) = w.upgrade() {
+                    tracing::info!(action = "fullscreen", on = !w.is_fullscreen(), "ui.action");
                     if w.is_fullscreen() { w.unfullscreen() } else { w.fullscreen() }
                 }
             }
-            gdk::Key::F1 => shortcuts.popup(),
+            gdk::Key::F1 => {
+                tracing::info!(action = "shortcuts", "ui.action");
+                shortcuts.popup()
+            }
             gdk::Key::_0 if ctrl => u.set_zoom(1.0, None),
             gdk::Key::equal | gdk::Key::plus if ctrl => u.set_zoom(u.zoom.get() * 1.25, None),
             gdk::Key::minus if ctrl => u.set_zoom(u.zoom.get() * 0.8, None),
@@ -929,6 +957,41 @@ fn wire_view(ui: &Rc<Ui>, window: &gtk::ApplicationWindow, shortcuts: &gtk::Menu
 /// A label that shortens with "…" instead of holding the sidebar wide.
 fn short_label(text: &str) -> gtk::Label {
     gtk::Label::builder().label(text).xalign(0.0).ellipsize(pango::EllipsizeMode::End).build()
+}
+
+/// Click to start timing from zero, click again to stop; the time stays up until the next start.
+fn stopwatch() -> gtk::ToggleButton {
+    let label = short_label("⏱ Start timer");
+    let button = gtk::ToggleButton::builder().child(&label).build();
+    let started = Rc::new(Cell::new(std::time::Instant::now()));
+    let tick: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+    button.connect_toggled(move |b| {
+        if let Some(id) = tick.borrow_mut().take() {
+            id.remove();
+        }
+        if b.is_active() {
+            tracing::info!(action = "timer_start", "ui.action");
+            started.set(std::time::Instant::now());
+            label.set_text("⏹ 0:00");
+            let (label, started) = (label.clone(), started.clone());
+            *tick.borrow_mut() = Some(glib::timeout_add_local(Duration::from_millis(250), move || {
+                label.set_text(&format!("⏹ {}", clock(started.get().elapsed())));
+                glib::ControlFlow::Continue
+            }));
+            b.set_tooltip_text(Some("Click to stop"));
+        } else {
+            tracing::info!(action = "timer_stop", seconds = started.get().elapsed().as_secs(), "ui.action");
+            label.set_text(&format!("⏱ Took {} — start again", clock(started.get().elapsed())));
+            b.set_tooltip_text(None);
+        }
+    });
+    button
+}
+
+/// 4:07, or 1:04:07 past an hour.
+fn clock(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
 }
 
 /// A dropdown whose button shortens long device names; the open list shows them whole.
@@ -1005,6 +1068,8 @@ fn shortcuts_button() -> gtk::MenuButton {
 /// Wake their display and dismiss the lock screen (logind, no password).
 fn wake_unlock(ui: &Rc<Ui>) {
     let station = ui.view().station.clone();
+    let name = station.config.name.clone();
+    tracing::info!(action = "wake_unlock", station = %name, "ui.action");
     station.send(ToStation::Wake);
     let (tx, rx) = async_channel::bounded(1);
     std::thread::spawn(move || {
@@ -1013,8 +1078,14 @@ fn wake_unlock(ui: &Rc<Ui>) {
     let u = ui.clone();
     glib::spawn_future_local(async move {
         let text = match rx.recv().await {
-            Ok(Ok(())) => "woke and unlocked".to_string(),
-            Ok(Err(e)) => format!("unlock failed: {e}"),
+            Ok(Ok(())) => {
+                tracing::info!(station = %name, "station.unlocked");
+                "woke and unlocked".to_string()
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(station = %name, error = %e, "station.unlock_failed");
+                format!("unlock failed: {e}")
+            }
             Err(_) => return,
         };
         u.status.set_text(&text);

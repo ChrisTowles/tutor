@@ -40,7 +40,7 @@ impl Out {
         if self.last_status.lock().unwrap().replace(text.clone()).as_deref() == Some(text.as_str()) {
             return;
         }
-        eprintln!("tutor-station: {text}");
+        tracing::warn!(%text, "station.status");
         self.send(FromStation::Status(text));
     }
 
@@ -66,7 +66,7 @@ pub fn spawn() -> (Out, thread::JoinHandle<()>) {
         .name("writer".into())
         .spawn(move || {
             if let Err(e) = write_loop(prio_rx, video_rx, cam_rx) {
-                eprintln!("tutor-station: stdout closed: {e}");
+                tracing::info!(error = %e, "stdout.closed");
             }
         })
         .expect("spawn writer");
