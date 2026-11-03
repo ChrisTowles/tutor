@@ -1,6 +1,6 @@
 //! The station's Wayland client: captures the kid's screen with
-//! `ext-image-copy-capture` and shows Dad's camera in a `wlr-layer-shell`
-//! overlay. Runs the calloop event loop on the main thread.
+//! `ext-image-copy-capture`, and shows Dad's camera and his pointer dot in
+//! `wlr-layer-shell` overlays. Runs the calloop event loop on the main thread.
 
 use std::{
     sync::Arc,
@@ -76,6 +76,8 @@ pub enum LoopMsg {
     DadCam(Option<Vec<u8>>),
     /// Move the overlay's centre (see `Streams::dad_cam_at`).
     DadCamAt((u16, u16)),
+    /// Dad's pointer dot (see `ToStation::Point`).
+    Point(Option<(u16, u16)>),
     Quit,
 }
 
@@ -91,6 +93,10 @@ const SHM_FORMATS: [(wl_shm::Format, &str); 4] = [
 
 /// Closest the overlay gets to a screen edge, inside the area panels leave free.
 const OVERLAY_MARGIN: i32 = 16;
+
+/// Dad's pointer dot: its square's side, and how long it stays after he lets go.
+const POINTER_SIZE: u32 = 56;
+const POINTER_LINGER: Duration = Duration::from_millis(1500);
 
 pub struct Wl {
     registry: RegistryState,
@@ -114,6 +120,9 @@ pub struct Wl {
 
     overlay: Option<Overlay>,
     dad_cam_at: (u16, u16),
+    pointer: Option<Pointer>,
+    /// Bumped on every pointer message, so a stale fade timer does nothing.
+    pointer_gen: u32,
     presence: Arc<Reporter>,
     power_manager: Option<ZwlrOutputPowerManagerV1>,
     _power: Option<ZwlrOutputPowerV1>,
@@ -140,6 +149,11 @@ struct Overlay {
     pool: SlotPool,
     configured: bool,
     pending: Option<Vec<u8>>,
+}
+
+struct Pointer {
+    layer: LayerSurface,
+    pool: SlotPool,
 }
 
 impl Wl {
@@ -183,6 +197,8 @@ impl Wl {
             hello_sent: false,
             overlay: None,
             dad_cam_at: (0, 0),
+            pointer: None,
+            pointer_gen: 0,
             presence,
             power_manager,
             _power: None,
@@ -207,8 +223,55 @@ impl Wl {
                 self.dad_cam_at = at;
                 self.place_overlay();
             }
+            LoopMsg::Point(at) => self.point(at),
             LoopMsg::Quit => self.exit = true,
         }
+    }
+
+    /// Their screen's logical size, which `0..=ABS_MAX` spans.
+    fn screen_size(&self) -> (i32, i32) {
+        self.outputs.outputs().next().and_then(|o| self.outputs.info(&o)?.logical_size).unwrap_or((1920, 1080))
+    }
+
+    fn point(&mut self, at: Option<(u16, u16)>) {
+        self.pointer_gen = self.pointer_gen.wrapping_add(1);
+        let Some((x, y)) = at else {
+            let generation = self.pointer_gen;
+            let _ = self.handle.insert_source(Timer::from_duration(POINTER_LINGER), move |_, _, wl| {
+                if wl.pointer_gen == generation {
+                    wl.pointer = None;
+                }
+                TimeoutAction::Drop
+            });
+            return;
+        };
+        if self.pointer.is_none() {
+            let Some(layer_shell) = &self.layer_shell else {
+                self.out.status("pointer: no layer-shell on this desktop");
+                return;
+            };
+            let surface = self.compositor.create_surface(&self.qh);
+            if let Ok(region) = Region::new(&self.compositor) {
+                surface.set_input_region(Some(region.wl_region()));
+            }
+            let layer = layer_shell.create_layer_surface(&self.qh, surface, Layer::Overlay, Some("tutor-pointer"), None);
+            layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+            layer.set_size(POINTER_SIZE, POINTER_SIZE);
+            // Measured from the screen's corner, not below their panel, to match the stream.
+            layer.set_exclusive_zone(-1);
+            layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+            let Ok(pool) = SlotPool::new((POINTER_SIZE * POINTER_SIZE * 4 * 2) as usize, &self.shm) else { return };
+            self.pointer = Some(Pointer { layer, pool });
+        }
+        let (sw, sh) = self.screen_size();
+        let size = POINTER_SIZE as i32;
+        let axis = |at: u16, screen: i32| {
+            let centre = (at as f64 / ABS_MAX as f64 * screen as f64) as i32;
+            (centre - size / 2).clamp(0, (screen - size).max(0))
+        };
+        let pointer = self.pointer.as_ref().unwrap();
+        pointer.layer.set_margin(axis(y, sh), 0, 0, axis(x, sw));
+        pointer.layer.commit();
     }
 
     fn start_session(&mut self, output: &wl_output::WlOutput) {
@@ -357,12 +420,7 @@ impl Wl {
     /// Margins from the top-left that put the overlay's centre at `dad_cam_at`.
     fn place_overlay(&mut self) {
         let Some(overlay) = &self.overlay else { return };
-        let (sw, sh) = self
-            .outputs
-            .outputs()
-            .next()
-            .and_then(|o| self.outputs.info(&o)?.logical_size)
-            .unwrap_or((1920, 1080));
+        let (sw, sh) = self.screen_size();
         let (w, h) = (DAD_CAM_SIZE.0 as i32, DAD_CAM_SIZE.1 as i32);
         let axis = |at: u16, screen: i32, size: i32| {
             let centre = (at as f64 / ABS_MAX as f64 * screen as f64) as i32;
@@ -413,6 +471,30 @@ impl Overlay {
         canvas[..n].copy_from_slice(&frame[..n]);
         let surface = self.layer.wl_surface();
         surface.damage_buffer(0, 0, w as i32, h as i32);
+        if buffer.attach_to(surface).is_ok() {
+            self.layer.commit();
+        }
+    }
+}
+
+impl Pointer {
+    /// A red dot in a white ring, antialiased, on a clear square.
+    fn draw(&mut self) {
+        let s = POINTER_SIZE as i32;
+        let Ok((buffer, canvas)) = self.pool.create_buffer(s, s, s * 4, wl_shm::Format::Argb8888) else { return };
+        let c = s as f32 / 2.0;
+        for (i, px) in canvas.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (x, y) = ((i as i32 % s) as f32 + 0.5, (i as i32 / s) as f32 + 0.5);
+            let d = ((x - c).powi(2) + (y - c).powi(2)).sqrt();
+            let alpha = (c - 3.0 - d).clamp(0.0, 1.0);
+            // Red inside, white for the outer 4 px, blended across one pixel.
+            let white = (d - (c - 8.0)).clamp(0.0, 1.0);
+            let (r, g, b) = (230.0 + 25.0 * white, 40.0 + 215.0 * white, 40.0 + 215.0 * white);
+            // Premultiplied, little-endian ARGB: B, G, R, A.
+            *px = [(b * alpha) as u8, (g * alpha) as u8, (r * alpha) as u8, (255.0 * alpha) as u8];
+        }
+        let surface = self.layer.wl_surface();
+        surface.damage_buffer(0, 0, s, s);
         if buffer.attach_to(surface).is_ok() {
             self.layer.commit();
         }
@@ -542,12 +624,20 @@ impl CompositorHandler for Wl {
 }
 
 impl LayerShellHandler for Wl {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.overlay = None;
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        if self.pointer.as_ref().is_some_and(|p| p.layer.wl_surface() == layer.wl_surface()) {
+            self.pointer = None;
+        } else {
+            self.overlay = None;
+        }
     }
 
-    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface, _: LayerSurfaceConfigure, _: u32) {
-        if let Some(overlay) = &mut self.overlay {
+    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface, _: LayerSurfaceConfigure, _: u32) {
+        if let Some(pointer) = &mut self.pointer
+            && pointer.layer.wl_surface() == layer.wl_surface()
+        {
+            pointer.draw();
+        } else if let Some(overlay) = &mut self.overlay {
             overlay.configured = true;
             overlay.draw();
         }

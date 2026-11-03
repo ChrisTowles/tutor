@@ -8,7 +8,7 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Bumped whenever a message changes shape.
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 
 /// Largest frame either side accepts. A 3440x1440 keyframe is well under 2 MB.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -38,6 +38,11 @@ pub enum ToStation {
     SetOutput(String),
     /// Use this mic for their voice, by name.
     SetMic(String),
+    /// Set their output's volume, in percent (0..=100).
+    SetVolume(u8),
+    /// Show a pointer dot on their screen at this spot (`0..=ABS_MAX` on each
+    /// axis), or `None` to let it fade.
+    Point(Option<(u16, u16)>),
     /// Wake their display (a harmless Shift tap).
     Wake,
     /// Answered with `Pong` carrying the same value, to time the round trip.
@@ -96,9 +101,10 @@ pub enum FromStation {
     AppAudio(Vec<u8>),
     /// Something the UI should show, e.g. "camera busy".
     Status(String),
-    /// Their outputs and mics as (name, description), and the ones in use.
-    /// Sent on connect and whenever a device comes, goes or is chosen.
-    Devices { outputs: Vec<(String, String)>, output: String, mics: Vec<(String, String)>, mic: String },
+    /// Their outputs and mics as (name, description), the ones in use (empty
+    /// when there's none) and the output's volume in percent. Sent on connect
+    /// and whenever a device comes, goes or is chosen, or the volume changes.
+    Devices { outputs: Vec<(String, String)>, output: String, mics: Vec<(String, String)>, mic: String, volume: u8 },
     /// Whether anyone can see their screen right now. Sent whenever it changes.
     Presence(Presence),
     /// Reply to `Ping`, with the screen frames dropped since the last one

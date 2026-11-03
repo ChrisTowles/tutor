@@ -111,3 +111,28 @@ Running log while building against [docs/plan.html](docs/plan.html).
   hook → `app.crash`). Writer only: towles-tool's reader, Attention and Rules screens aren't ported, `jq` covers it
   for now. Every `eprintln!` in both binaries became a named event. The station logs on the kid's PC; its stderr
   still reaches Dad's terminal through SSH.
+- **"Their sound on" stuck at (None) on Logan's PC.** The station started while his Jabra was unplugged and his
+  monitor (the HDMI output) asleep, so PipeWire offered only its `auto_null` placeholder. `Route::setup` picked it,
+  the loopback couldn't be moved onto it ("loopback won't stay on auto_null"), and setup failed for the whole
+  session: no device list for the pickers, no device watching, and "Hear apps" silent. `auto_null` is no longer a
+  device, and a missing output or mic no longer fails setup: the app sink still goes up and the watcher picks the
+  device when it appears. Dad's voice and their mic report "no output"/"no microphone" until then.
+- **A stopped station puts their audio back.** SIGTERM, SIGINT and SIGHUP now take the same exit as stdin closing
+  (`signal-hook`): media stopped, audio route torn down, `station.stopped` logged with the `signal`. Before, a kill
+  left `tutor_apps` as their default sink. `replace_older` relied on that teardown without getting it; it now waits
+  up to 5 s for the older station to exit, then SIGKILLs it (`stuck` in `station.replaced_older`), so the older
+  teardown can't unload the newer station's `tutor_apps`.
+- **Problems stay on the card until fixed.** Under each PC's name, in amber: "🔇 no speakers", "🎧 headset unplugged"
+  (its `headset` pattern is set but the output isn't it), "🎙 no mic", "📷 camera not working". Worked out in the app
+  from the `Devices` the station already sends; the camera one is set by a `camera:` status and cleared by the next
+  webcam frame. Protocol v8.
+- **Pointing.** With Control off, a left click or drag on their screen puts a red dot (56 px, white ring) there; it
+  stays 1.5 s after the button comes up. It's a second layer-shell overlay with an empty input region, positioned by
+  margins from the screen's corner (`exclusive_zone -1`, so their panel doesn't offset it). Panning while zoomed
+  moved from left-drag to right- or middle-drag; Shift+left-drag still moves my cam.
+- **Their volume.** A slider under "Their sound on" sets their output sink's volume (`pactl set-sink-volume`), sent
+  at most every 100 ms while dragging and logged once it settles. `Devices` carries the volume, and the station
+  re-sends it when their sink changes volume, so their own volume keys move the slider.
+- **The station exits after teardown instead of joining its threads.** The presence and lock watchers hold the
+  writer open forever, so a station whose stdin closed but whose stdout didn't (SSH still up) used to hang after
+  restoring the audio.

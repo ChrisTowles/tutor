@@ -31,13 +31,18 @@ struct View {
     paint: Paintables,
     card: gtk::Button,
     title: gtk::Label,
+    /// Problems that last until fixed (no headset, no camera); hidden when none.
+    problems: gtk::Label,
     sub: gtk::Label,
     level: gtk::LevelBar,
     online: Cell<bool>,
     note: RefCell<String>,
     /// "My cam" is remembered per PC.
     dad_cam: Cell<bool>,
-    devices: RefCell<Devices>,
+    /// `None` until the station first reports them.
+    devices: RefCell<Option<Devices>>,
+    /// Their camera reported an error and no frame has come since.
+    camera_failed: Cell<bool>,
     presence: Cell<Presence>,
     link: Cell<Link>,
     /// Where my cam sits on their screen (`Streams::dad_cam_at`), per PC.
@@ -85,6 +90,9 @@ struct Ui {
     health: gtk::Label,
     status: gtk::Label,
     output: gtk::DropDown,
+    volume: gtk::Scale,
+    /// Set while Dad moves the volume slider, so their echoes don't move it back.
+    volume_busy: Cell<bool>,
     mic: gtk::DropDown,
     quality: gtk::DropDown,
     toggles: Toggles,
@@ -186,7 +194,8 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
     css.load_from_string(
         ".health { padding: 4px 10px; border-radius: 999px; font-feature-settings: 'tnum'; }
          .health.laggy { background: rgba(200, 130, 0, 0.9); color: white; font-weight: bold; }
-         .health.stalled { background: rgba(190, 30, 30, 0.92); color: white; font-weight: bold; font-size: 1.3em; }",
+         .health.stalled { background: rgba(190, 30, 30, 0.92); color: white; font-weight: bold; font-size: 1.3em; }
+         .problems { color: #e5a50a; font-weight: bold; }",
     );
     gtk::style_context_add_provider_for_display(
         &gtk::prelude::WidgetExt::display(&health),
@@ -214,6 +223,12 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
     grid.attach(&stopwatch(), 0, 3, 2, 1);
     let output = device_picker();
     output.set_hexpand(true);
+    let volume = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 100.0, 5.0);
+    volume.set_hexpand(true);
+    volume.set_draw_value(true);
+    volume.set_value_pos(gtk::PositionType::Right);
+    volume.set_format_value_func(|_, v| format!("{v:.0}%"));
+    volume.set_sensitive(false);
     let mic = device_picker();
     mic.set_hexpand(true);
     let quality = device_picker();
@@ -223,10 +238,11 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
     // Labels above the pickers, not beside them: keeps the sidebar narrow.
     pickers.attach(&short_label("Their sound on"), 0, 0, 1, 1);
     pickers.attach(&output, 0, 1, 1, 1);
-    pickers.attach(&short_label("Their mic"), 0, 2, 1, 1);
-    pickers.attach(&mic, 0, 3, 1, 1);
-    pickers.attach(&short_label("Their screen quality"), 0, 4, 1, 1);
-    pickers.attach(&quality, 0, 5, 1, 1);
+    pickers.attach(&volume, 0, 2, 1, 1);
+    pickers.attach(&short_label("Their mic"), 0, 3, 1, 1);
+    pickers.attach(&mic, 0, 4, 1, 1);
+    pickers.attach(&short_label("Their screen quality"), 0, 5, 1, 1);
+    pickers.attach(&quality, 0, 6, 1, 1);
     let shortcuts = shortcuts_button();
     let status = gtk::Label::builder().wrap(true).xalign(0.0).css_classes(["dim-label"]).build();
     let side = gtk::Box::builder()
@@ -252,10 +268,13 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
             .height_request(54)
             .build();
         let title = gtk::Label::builder().xalign(0.0).ellipsize(pango::EllipsizeMode::End).css_classes(["heading"]).build();
+        let problems =
+            gtk::Label::builder().xalign(0.0).wrap(true).visible(false).css_classes(["caption", "problems"]).build();
         let sub = gtk::Label::builder().xalign(0.0).ellipsize(pango::EllipsizeMode::End).css_classes(["caption", "dim-label"]).build();
         let level = gtk::LevelBar::for_interval(0.0, 1.0);
         let text = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).hexpand(true).build();
         text.append(&title);
+        text.append(&problems);
         text.append(&sub);
         text.append(&level);
         let row = gtk::Box::builder().spacing(8).build();
@@ -269,12 +288,14 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
             paint,
             card,
             title,
+            problems,
             sub,
             level,
             online: Cell::new(false),
             note: RefCell::new("connecting…".into()),
             dad_cam: Cell::new(ss.dad_cam),
-            devices: RefCell::new(Devices::default()),
+            devices: RefCell::new(None),
+            camera_failed: Cell::new(false),
             presence: Cell::new(Presence::default()),
             link: Cell::new(Link::default()),
             quality: Cell::new(ss.quality.min(QUALITIES.len() as u32 - 1)),
@@ -330,6 +351,8 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
         health,
         status,
         output,
+        volume,
+        volume_busy: Cell::new(false),
         mic,
         quality,
         toggles,
@@ -354,13 +377,14 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
         });
     }
     wire_toggles(&ui);
+    wire_volume(&ui);
     let u = ui.clone();
     ui.output.connect_selected_notify(move |d| {
         if u.updating.get() {
             return;
         }
         let v = u.view();
-        let name = v.devices.borrow().outputs.get(d.selected() as usize).map(|(n, _)| n.clone());
+        let name = v.devices.borrow().as_ref().and_then(|ds| ds.outputs.get(d.selected() as usize)).map(|(n, _)| n.clone());
         if let Some(name) = name {
             tracing::info!(action = "their_output", station = %v.station.config.name, device = %name, "ui.action");
             v.station.send(ToStation::SetOutput(name));
@@ -372,7 +396,7 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
             return;
         }
         let v = u.view();
-        let name = v.devices.borrow().mics.get(d.selected() as usize).map(|(n, _)| n.clone());
+        let name = v.devices.borrow().as_ref().and_then(|ds| ds.mics.get(d.selected() as usize)).map(|(n, _)| n.clone());
         if let Some(name) = name {
             tracing::info!(action = "their_mic", station = %v.station.config.name, device = %name, "ui.action");
             v.station.send(ToStation::SetMic(name));
@@ -547,6 +571,9 @@ impl Ui {
                 }
             }
             v.sub.set_text(&bits.join(" · "));
+            let problems = if v.online.get() { v.problems() } else { Vec::new() };
+            v.problems.set_text(&problems.join(" · "));
+            v.problems.set_visible(!problems.is_empty());
         }
         let v = self.view();
         let name = &v.station.config.name;
@@ -590,6 +617,8 @@ impl Ui {
             Event::Offline(reason) => {
                 v.presence.set(Presence::default());
                 v.online.set(false);
+                *v.devices.borrow_mut() = None;
+                v.camera_failed.set(false);
                 v.level.set_value(0.0);
                 *v.note.borrow_mut() = format!("{reason} · retrying");
                 if i == self.selected.get() {
@@ -597,21 +626,28 @@ impl Ui {
                 }
                 self.sync();
             }
-            Event::Status(s) => *v.note.borrow_mut() = s,
+            Event::Status(s) => {
+                // Cleared by the next frame from their camera (see `Event::Link`).
+                if s.starts_with("camera:") {
+                    v.camera_failed.set(true);
+                }
+                *v.note.borrow_mut() = s;
+            }
             Event::Presence(p) => v.presence.set(p),
             Event::Devices(d) => {
-                *v.devices.borrow_mut() = d;
+                *v.devices.borrow_mut() = Some(d);
                 if i == self.selected.get() {
                     self.show_devices();
                 }
-                return;
             }
             Event::Level(l) => {
                 v.level.set_value(l);
                 return;
             }
             Event::Link(link) => {
-                let changed = link.laggy() != v.link.get().laggy() || link.stalled() != v.link.get().stalled();
+                let camera_back = link.cam_kbps > 0 && v.camera_failed.replace(false);
+                let changed =
+                    camera_back || link.laggy() != v.link.get().laggy() || link.stalled() != v.link.get().stalled();
                 v.link.set(link);
                 if i == self.selected.get() {
                     self.show_health();
@@ -655,9 +691,11 @@ impl Ui {
         h.set_text(&text);
     }
 
-    /// Fill the output and mic pickers from the selected station's devices.
+    /// Fill the output and mic pickers and the volume from the selected station's devices.
     fn show_devices(&self) {
-        let d = self.view().devices.borrow();
+        let devices = self.view().devices.borrow();
+        let empty = Devices::default();
+        let d = devices.as_ref().unwrap_or(&empty);
         self.updating.set(true);
         for (picker, list, current) in [(&self.output, &d.outputs, &d.output), (&self.mic, &d.mics, &d.mic)] {
             let names: Vec<&str> = list.iter().map(|(_, desc)| desc.as_str()).collect();
@@ -667,6 +705,10 @@ impl Ui {
             }
             picker.set_sensitive(!list.is_empty());
         }
+        if !self.volume_busy.get() {
+            self.volume.set_value(d.volume as f64);
+        }
+        self.volume.set_sensitive(!d.output.is_empty());
         self.updating.set(false);
     }
 
@@ -724,6 +766,15 @@ impl Ui {
         }
     }
 
+    /// Show my pointer dot on their screen under `(x, y)`, in the scrolled view's coordinates.
+    fn point_at(&self, x: f64, y: f64) {
+        if let Some(p) = self.screen_scroll.compute_point(&self.screen, &graphene::Point::new(x as f32, y as f32))
+            && let Some(at) = self.to_abs(p.x() as f64, p.y() as f64)
+        {
+            self.view().station.send(ToStation::Point(Some(at)));
+        }
+    }
+
     /// Widget coordinates on the screen view to the kid's absolute pointer space.
     fn to_abs(&self, x: f64, y: f64) -> Option<(u16, u16)> {
         let p = self.screen.paintable()?;
@@ -739,6 +790,58 @@ impl Ui {
         let max = ABS_MAX as f64;
         Some(((nx * max).round() as u16, (ny * max).round() as u16))
     }
+}
+
+impl View {
+    /// What's wrong on their PC until it's fixed, for the card.
+    fn problems(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if let Some(d) = &*self.devices.borrow() {
+            let headset = &self.station.config.headset;
+            if d.output.is_empty() {
+                out.push("🔇 no speakers");
+            } else if !headset.is_empty() && !d.output.contains(headset.as_str()) {
+                out.push("🎧 headset unplugged");
+            }
+            if d.mic.is_empty() {
+                out.push("🎙 no mic");
+            }
+        }
+        if self.camera_failed.get() {
+            out.push("📷 camera not working");
+        }
+        out
+    }
+}
+
+/// Their volume: sent at most every 100 ms while the slider moves, logged once it settles.
+fn wire_volume(ui: &Rc<Ui>) {
+    let armed = Rc::new(Cell::new(false));
+    let settle: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+    let u = ui.clone();
+    ui.volume.connect_value_changed(move |_| {
+        if u.updating.get() {
+            return;
+        }
+        u.volume_busy.set(true);
+        if !armed.replace(true) {
+            let (u, armed) = (u.clone(), armed.clone());
+            glib::timeout_add_local_once(Duration::from_millis(100), move || {
+                armed.set(false);
+                u.view().station.send(ToStation::SetVolume(u.volume.value().round() as u8));
+            });
+        }
+        if let Some(t) = settle.borrow_mut().take() {
+            t.remove();
+        }
+        let (u, s) = (u.clone(), settle.clone());
+        *settle.borrow_mut() = Some(glib::timeout_add_local_once(Duration::from_millis(600), move || {
+            s.borrow_mut().take();
+            u.volume_busy.set(false);
+            let percent = u.volume.value().round() as u8;
+            tracing::info!(action = "their_volume", station = %u.view().station.config.name, percent, "ui.action");
+        }));
+    });
 }
 
 fn wire_toggles(ui: &Rc<Ui>) {
@@ -882,38 +985,66 @@ fn wire_input(ui: &Rc<Ui>) {
     ui.screen.add_controller(focus);
 }
 
-/// Zoom, pan and full screen. All of it only while Control is off, when the
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Drag {
+    Pan,
+    MoveCam,
+    Point,
+}
+
+/// Pointing, zoom, pan and full screen. All of it only while Control is off, when the
 /// mouse and keys are ours rather than theirs (Ctrl+scroll zooms either way).
 fn wire_view(ui: &Rc<Ui>, window: &gtk::ApplicationWindow, shortcuts: &gtk::MenuButton) {
-    let drag = gtk::GestureDrag::new();
+    // Left drag points at their screen (Shift: moves my cam there); any other button pans while zoomed.
+    let drag = gtk::GestureDrag::builder().button(0).build();
     let start = Rc::new(Cell::new((0.0, 0.0)));
-    // Shift+drag moves my cam on their screen instead of panning.
-    let moving_cam = Rc::new(Cell::new(false));
-    let (u, st, mc) = (ui.clone(), start.clone(), moving_cam.clone());
-    drag.connect_drag_begin(move |g, _, _| {
-        mc.set(!u.control.get() && g.current_event_state().contains(gdk::ModifierType::SHIFT_MASK));
+    let mode = Rc::new(Cell::new(Drag::Pan));
+    let (u, st, md) = (ui.clone(), start.clone(), mode.clone());
+    drag.connect_drag_begin(move |g, x, y| {
+        let shift = g.current_event_state().contains(gdk::ModifierType::SHIFT_MASK);
+        md.set(match g.current_button() {
+            _ if u.control.get() => Drag::Pan,
+            1 if shift => Drag::MoveCam,
+            1 => Drag::Point,
+            _ => Drag::Pan,
+        });
+        if md.get() == Drag::Point {
+            tracing::info!(action = "point", station = %u.view().station.config.name, "ui.action");
+            u.point_at(x, y);
+        }
         st.set((u.screen_scroll.hadjustment().value(), u.screen_scroll.vadjustment().value()));
     });
-    let u = ui.clone();
+    let (u, md) = (ui.clone(), mode.clone());
     drag.connect_drag_update(move |g, dx, dy| {
-        if moving_cam.get() {
-            let Some((x0, y0)) = g.start_point() else { return };
-            let Some(p) = u.screen_scroll.compute_point(&u.screen, &graphene::Point::new((x0 + dx) as f32, (y0 + dy) as f32))
-            else {
-                return;
-            };
-            if let Some(at) = u.to_abs(p.x() as f64, p.y() as f64) {
-                u.view().dad_cam_at.set(at);
-                u.sync();
+        let Some((x0, y0)) = g.start_point() else { return };
+        match md.get() {
+            Drag::Point => u.point_at(x0 + dx, y0 + dy),
+            Drag::MoveCam => {
+                let Some(p) =
+                    u.screen_scroll.compute_point(&u.screen, &graphene::Point::new((x0 + dx) as f32, (y0 + dy) as f32))
+                else {
+                    return;
+                };
+                if let Some(at) = u.to_abs(p.x() as f64, p.y() as f64) {
+                    u.view().dad_cam_at.set(at);
+                    u.sync();
+                }
             }
-            return;
+            Drag::Pan => {
+                if u.control.get() || u.zoom.get() <= 1.0 {
+                    return;
+                }
+                let (x, y) = start.get();
+                u.screen_scroll.hadjustment().set_value(x - dx);
+                u.screen_scroll.vadjustment().set_value(y - dy);
+            }
         }
-        if u.control.get() || u.zoom.get() <= 1.0 {
-            return;
+    });
+    let u = ui.clone();
+    drag.connect_drag_end(move |_, _, _| {
+        if mode.replace(Drag::Pan) == Drag::Point {
+            u.view().station.send(ToStation::Point(None));
         }
-        let (x, y) = start.get();
-        u.screen_scroll.hadjustment().set_value(x - dx);
-        u.screen_scroll.vadjustment().set_value(y - dy);
     });
     ui.screen_scroll.add_controller(drag);
 
@@ -1024,10 +1155,11 @@ fn device_picker() -> gtk::DropDown {
 }
 
 /// Every key and mouse trick, one click (or F1) away.
-const SHORTCUTS: [(&str, &str); 11] = [
+const SHORTCUTS: [(&str, &str); 12] = [
+    ("Click / drag", "Point: they see a red dot there"),
     ("Shift + drag", "Move your cam on their screen (My cam on)"),
     ("Ctrl + scroll", "Zoom in/out on their screen (always)"),
-    ("Drag", "Pan while zoomed"),
+    ("Right-drag", "Pan while zoomed"),
     ("Double-click", "Fit their whole screen"),
     ("Ctrl + = / Ctrl + −", "Zoom in / out"),
     ("Ctrl + 0", "Fit their whole screen"),
