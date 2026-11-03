@@ -18,6 +18,8 @@ pub struct Route {
     pub sink: String,
     /// Their mic.
     pub source: String,
+    /// Their output's volume as last sent to Dad, to spot changes they make.
+    pub volume: u8,
     loopback: Option<u32>,
 }
 
@@ -25,8 +27,10 @@ impl Route {
     pub fn setup(pattern: &str) -> Result<Self> {
         let default_sink = pactl(&["get-default-sink"])?;
         let default_source = pactl(&["get-default-source"])?;
-        let sink = pick(&sink_names()?, pattern, &default_sink).context("no output device")?;
-        let source = pick(&source_names()?, pattern, &default_source).context("no microphone")?;
+        // Either can be missing (headset unplugged, monitor asleep): the
+        // device watcher fills it in when one appears.
+        let sink = pick(&sink_names()?, pattern, &default_sink);
+        let source = pick(&source_names()?, pattern, &default_source).unwrap_or_default();
 
         // Recreate rather than reuse: a leftover loopback may point at a device that has since gone.
         unload_app_sink();
@@ -39,8 +43,12 @@ impl Route {
         // The device-restore database had this sink at 150%, which clipped
         // everything Dad heard. Unity gain: their own volume is the headset's.
         pactl(&["set-sink-volume", APP_SINK, "100%"])?;
-        let mut route = Self { pattern: pattern.to_string(), sink: String::new(), source, loopback: None };
-        route.set_sink(&sink)?;
+        let mut route = Self { pattern: pattern.to_string(), sink: String::new(), source, volume: 0, loopback: None };
+        if let Some(sink) = sink
+            && let Err(e) = route.set_sink(&sink)
+        {
+            tracing::warn!(error = format!("{e:#}"), "audio.output_failed");
+        }
         pactl(&["set-default-sink", APP_SINK])?;
         for input in sink_inputs()? {
             // Never our loopback (a feedback loop) or our own streams; a Steam
@@ -122,6 +130,24 @@ impl Route {
     }
 }
 
+/// `sink`'s volume in percent (its first channel); `None` without one.
+pub fn volume(sink: &str) -> Option<u8> {
+    if sink.is_empty() {
+        return None;
+    }
+    parse_volume(&pactl(&["get-sink-volume", sink]).ok()?)
+}
+
+pub fn set_volume(sink: &str, percent: u8) -> Result<()> {
+    pactl(&["set-sink-volume", sink, &format!("{}%", percent.min(100))]).map(drop)
+}
+
+/// "Volume: front-left: 42597 /  65% / -11.23 dB,   front-right: …" → 65.
+fn parse_volume(text: &str) -> Option<u8> {
+    let percent = text.split('%').next()?.rsplit('/').next()?.trim().parse::<u32>().ok()?;
+    Some(percent.min(255) as u8)
+}
+
 /// Their outputs (`kind` = "sinks") or mics ("sources") as (name, description);
 /// the app sink and monitors excluded.
 pub fn devices(kind: &str) -> Result<Vec<(String, String)>> {
@@ -160,8 +186,11 @@ fn sink_id(name: &str) -> Option<String> {
     list.lines().find(|l| l.split('\t').nth(1) == Some(name)).and_then(|l| l.split('\t').next()).map(str::to_string)
 }
 
+/// PipeWire's placeholder sink when it has no real output; nothing can be moved onto it.
+const NO_OUTPUT: &str = "auto_null";
+
 fn usable(name: &str) -> bool {
-    name != APP_SINK && !name.starts_with(&format!("{APP_SINK}.")) && !name.ends_with(".monitor")
+    name != APP_SINK && name != NO_OUTPUT && !name.starts_with(&format!("{APP_SINK}.")) && !name.ends_with(".monitor")
 }
 
 fn pick(names: &[String], pattern: &str, default: &str) -> Option<String> {
@@ -237,5 +266,18 @@ mod tests {
         assert_eq!(pick(&sinks, "Jabra", "tutor_apps").as_deref(), Some("alsa_output.hdmi"));
         let sinks = vec!["alsa_output.Jabra".to_string(), "tutor_apps".to_string()];
         assert_eq!(pick(&sinks, "Jabra", "tutor_apps").as_deref(), Some("alsa_output.Jabra"));
+    }
+
+    #[test]
+    fn reads_the_volume() {
+        let text = "Volume: front-left: 42597 /  65% / -11.23 dB,   front-right: 42597 /  65% / -11.23 dB\n        balance 0.00";
+        assert_eq!(parse_volume(text), Some(65));
+        assert_eq!(parse_volume("Volume: mono: 65536 / 100% / 0.00 dB"), Some(100));
+    }
+
+    #[test]
+    fn no_output_is_not_a_device() {
+        let sinks = vec!["tutor_apps".to_string(), "auto_null".to_string()];
+        assert_eq!(pick(&sinks, "Jabra", "auto_null"), None);
     }
 }

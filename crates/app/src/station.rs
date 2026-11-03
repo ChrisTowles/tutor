@@ -86,13 +86,15 @@ struct Stats {
     pong_at: AtomicU64,
 }
 
-/// Their outputs and mics as (name, description), and the ones in use.
+/// Their outputs and mics as (name, description), the ones in use (empty when
+/// there's none) and the output's volume in percent.
 #[derive(Default)]
 pub struct Devices {
     pub outputs: Vec<(String, String)>,
     pub output: String,
     pub mics: Vec<(String, String)>,
     pub mic: String,
+    pub volume: u8,
 }
 
 pub struct Station {
@@ -342,8 +344,8 @@ impl Station {
                     self.playback.voice(pcm);
                 }
                 FromStation::AppAudio(pcm) => self.playback.apps(pcm),
-                FromStation::Devices { outputs, output, mics, mic } => {
-                    let _ = events.send_blocking(Event::Devices(Devices { outputs, output, mics, mic }));
+                FromStation::Devices { outputs, output, mics, mic, volume } => {
+                    let _ = events.send_blocking(Event::Devices(Devices { outputs, output, mics, mic, volume }));
                 }
                 FromStation::Presence(p) => {
                     let _ = events.send_blocking(Event::Presence(p));

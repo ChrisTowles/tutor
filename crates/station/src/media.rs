@@ -319,6 +319,7 @@ impl Media {
     }
 
     fn build_kid_voice(&self) -> Result<gst::Pipeline> {
+        anyhow::ensure!(!self.headset_source.lock().unwrap().is_empty(), "no microphone");
         let pipeline = launch(&format!(
             "pulsesrc device=\"{}\" client-name=tutor-station buffer-time=40000 latency-time=10000 \
              ! audioconvert ! audioresample ! {VOICE_CAPS} ! appsink name=sink sync=false",
@@ -342,6 +343,7 @@ impl Media {
     fn build_dad_voice(&self) -> Result<gst::Pipeline> {
         // Straight to the headset by name: the default sink is tutor_apps,
         // which streams back to Dad and would echo his own voice.
+        anyhow::ensure!(!self.headset_sink.lock().unwrap().is_empty(), "no output");
         launch(&format!(
             "appsrc name=src is-live=true do-timestamp=true format=time caps=\"{VOICE_CAPS}\" \
              ! queue max-size-time=200000000 leaky=downstream ! audioconvert \

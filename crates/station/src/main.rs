@@ -1,6 +1,7 @@
 //! `tutor-station`: started by `tutor` on Dad's PC over SSH. Speaks the
 //! tutor-proto framing on stdin/stdout; logs go to stderr. Exits, putting the
-//! kid's audio back, when stdin closes.
+//! kid's audio back, when stdin closes or it's told to stop (SIGTERM, SIGINT,
+//! SIGHUP).
 
 mod audio_route;
 mod input;
@@ -15,12 +16,19 @@ use std::{
     os::unix::fs::MetadataExt,
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicI32, Ordering},
+    },
     thread,
     time::Duration,
 };
 
 use anyhow::{Context, Result};
+use signal_hook::{
+    consts::{SIGHUP, SIGINT, SIGTERM},
+    iterator::Signals,
+};
 use smithay_client_toolkit::reexports::calloop::{EventLoop, channel};
 use tutor_proto::{FromStation, ToStation, VERSION, read_frame, rss_kb};
 
@@ -85,7 +93,7 @@ fn main() -> Result<()> {
     let hostname = fs::read_to_string("/etc/hostname").unwrap_or_default().trim().to_string();
     tracing::info!(headset = %args.headset, camera = %args.camera, "station.started");
 
-    let (out, writer) = out::spawn();
+    let (out, _writer) = out::spawn();
     let route = Arc::new(Mutex::new(Route::setup(&args.headset).map_err(|e| out.status(format!("audio: {e:#}"))).ok()));
     let (loop_tx, loop_rx) = channel::channel::<LoopMsg>();
     let (sink, source) =
@@ -96,9 +104,20 @@ fn main() -> Result<()> {
     presence.announce();
     presence::watch_lock(presence.clone());
     let watcher = watch_devices(route.clone(), media.clone(), out.clone());
+    let signalled = Arc::new(AtomicI32::new(0));
+    {
+        let (signalled, loop_tx) = (signalled.clone(), loop_tx.clone());
+        let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP])?;
+        thread::Builder::new().name("signals".into()).spawn(move || {
+            if let Some(sig) = signals.forever().next() {
+                signalled.store(sig, Ordering::Relaxed);
+                let _ = loop_tx.send(LoopMsg::Quit);
+            }
+        })?;
+    }
     let mut injector = Injector::new().map_err(|e| out.status(format!("control: {e:#}"))).ok();
 
-    let reader = {
+    {
         let (media, out, loop_tx, route) = (media.clone(), out.clone(), loop_tx.clone(), route.clone());
         thread::Builder::new().name("reader".into()).spawn(move || {
             let mut stdin = io::stdin().lock();
@@ -135,6 +154,18 @@ fn main() -> Result<()> {
                         }
                         send_devices(&out, &route);
                     }
+                    Ok(Some(ToStation::SetVolume(percent))) => {
+                        let sink = route.lock().unwrap().as_ref().map(|r| r.sink.clone()).unwrap_or_default();
+                        if !sink.is_empty()
+                            && let Err(e) = audio_route::set_volume(&sink, percent)
+                        {
+                            out.status(format!("volume: {e:#}"));
+                        }
+                        send_devices(&out, &route);
+                    }
+                    Ok(Some(ToStation::Point(at))) => {
+                        let _ = loop_tx.send(LoopMsg::Point(at));
+                    }
                     Ok(Some(ToStation::SetOutput(sink))) => {
                         if let Some(r) = route.lock().unwrap().as_mut() {
                             match r.set_sink(&sink) {
@@ -155,8 +186,8 @@ fn main() -> Result<()> {
                 let _ = inj.release_all();
             }
             let _ = loop_tx.send(LoopMsg::Quit);
-        })?
-    };
+        })?;
+    }
 
     let mut event_loop: EventLoop<'static, Wl> = EventLoop::try_new()?;
     match Wl::connect(event_loop.handle(), media.clone(), out.clone(), hostname.clone(), presence.clone()) {
@@ -204,24 +235,29 @@ fn main() -> Result<()> {
     if let Some(route) = route.lock().unwrap().as_ref() {
         route.teardown();
     }
-    let _ = reader.join();
-    drop((out, media, loop_tx, route));
-    let _ = writer.join();
-    tracing::info!("station.stopped");
-    Ok(())
+    // Exit rather than join: after a signal the reader is still blocked on
+    // stdin, and the presence and lock watchers hold the writer open for good.
+    // Held keys go with the uinput devices.
+    let signal = signalled.load(Ordering::Relaxed);
+    tracing::info!(signal, "station.stopped");
+    std::process::exit(0)
 }
 
 fn send_devices(out: &out::Out, route: &Mutex<Option<Route>>) {
-    let (output, mic) = match route.lock().unwrap().as_ref() {
-        Some(r) => (r.sink.clone(), r.source.clone()),
+    let (output, mic, volume) = match route.lock().unwrap().as_mut() {
+        Some(r) => {
+            r.volume = audio_route::volume(&r.sink).unwrap_or(0);
+            (r.sink.clone(), r.source.clone(), r.volume)
+        }
         None => return,
     };
     if let (Ok(outputs), Ok(mics)) = (audio_route::devices("sinks"), audio_route::devices("sources")) {
-        out.send(FromStation::Devices { outputs, output, mics, mic });
+        out.send(FromStation::Devices { outputs, output, mics, mic, volume });
     }
 }
 
-/// Follow headsets as they're plugged in and out (`pactl subscribe`).
+/// Follow headsets as they're plugged in and out, and volume changes they
+/// make (`pactl subscribe`).
 fn watch_devices(route: Arc<Mutex<Option<Route>>>, media: Arc<Media>, out: out::Out) -> Option<Child> {
     let mut child = Command::new("pactl").arg("subscribe").stdout(Stdio::piped()).spawn().ok()?;
     let stdout = child.stdout.take()?;
@@ -229,6 +265,17 @@ fn watch_devices(route: Arc<Mutex<Option<Route>>>, media: Arc<Media>, out: out::
         .name("devices".into())
         .spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line.contains("'change' on sink #") {
+                    let changed = route
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|r| audio_route::volume(&r.sink).is_some_and(|v| v != r.volume));
+                    if changed {
+                        send_devices(&out, &route);
+                    }
+                    continue;
+                }
                 let device = line.contains(" on sink #") || line.contains(" on source #");
                 if !device || !(line.contains("'new'") || line.contains("'remove'")) {
                     continue;
@@ -273,7 +320,18 @@ fn replace_older() {
         return;
     }
     let _ = std::process::Command::new("kill").args(&older).status();
-    // Let it tear down its audio route before we build ours.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    tracing::info!(pids = older.join(" "), "station.replaced_older");
+    // Let it tear down its audio route before we build ours: its teardown
+    // unloads every tutor_apps module, ours included if we went first.
+    let alive = || older.iter().filter(|p| fs::exists(format!("/proc/{p}")).unwrap_or(false)).count();
+    for _ in 0..50 {
+        if alive() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let stuck = alive() > 0;
+    if stuck {
+        let _ = std::process::Command::new("kill").arg("-KILL").args(&older).status();
+    }
+    tracing::info!(pids = older.join(" "), stuck, "station.replaced_older");
 }
