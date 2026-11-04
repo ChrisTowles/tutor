@@ -10,9 +10,6 @@ One window on Dad's PC to see, hear, talk to and drive the kids' PCs during tuto
   click-through overlay, and replays Dad's mouse/keyboard through `/dev/uinput`.
 - **`tutor-proto`** (`crates/proto`) — the framed messages between them.
 
-The design and the decisions behind it are in [docs/plan.html](docs/plan.html); what changed while building is in
-[implementation-notes.md](implementation-notes.md).
-
 ## Build and run
 
 Needs `libgtk-4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev` on this PC.

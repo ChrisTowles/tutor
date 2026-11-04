@@ -91,8 +91,9 @@ struct Ui {
     status: gtk::Label,
     output: gtk::DropDown,
     volume: gtk::Scale,
-    /// Set while Dad moves the volume slider, so their echoes don't move it back.
-    volume_busy: Cell<bool>,
+    /// The PC whose volume Dad is moving the slider for, while he moves it: their
+    /// echoes don't move it back, and a pending send can't land on another PC.
+    volume_for: Cell<Option<usize>>,
     mic: gtk::DropDown,
     quality: gtk::DropDown,
     toggles: Toggles,
@@ -352,7 +353,7 @@ fn build(app: &gtk::Application, config: &Config) -> Result<()> {
         status,
         output,
         volume,
-        volume_busy: Cell::new(false),
+        volume_for: Cell::new(None),
         mic,
         quality,
         toggles,
@@ -469,12 +470,13 @@ impl Ui {
         self.toggles.cam.set_active(v.dad_cam.get());
         self.quality.set_selected(v.quality.get());
         self.updating.set(false);
+        // Drops a volume still on its way to the PC we left.
+        self.volume_for.set(None);
         self.show_devices();
         self.sync();
         self.refresh();
     }
 
-    /// Push every station's wanted streams (see the switching table in the plan).
     /// Settings as the window shows them now.
     fn snapshot(&self) -> Settings {
         Settings {
@@ -509,6 +511,9 @@ impl Ui {
         });
     }
 
+    /// Push every station's wanted streams: every PC sends its mic, the selected one
+    /// also its fast screen and webcam (plus app sound and my voice when on), the
+    /// others a slow screen.
     fn sync(&self) {
         let sel = self.selected.get();
         let mut any_cam = false;
@@ -705,7 +710,7 @@ impl Ui {
             }
             picker.set_sensitive(!list.is_empty());
         }
-        if !self.volume_busy.get() {
+        if self.volume_for.get().is_none() {
             self.volume.set_value(d.volume as f64);
         }
         self.volume.set_sensitive(!d.output.is_empty());
@@ -823,12 +828,14 @@ fn wire_volume(ui: &Rc<Ui>) {
         if u.updating.get() {
             return;
         }
-        u.volume_busy.set(true);
+        u.volume_for.set(Some(u.selected.get()));
         if !armed.replace(true) {
             let (u, armed) = (u.clone(), armed.clone());
             glib::timeout_add_local_once(Duration::from_millis(100), move || {
                 armed.set(false);
-                u.view().station.send(ToStation::SetVolume(u.volume.value().round() as u8));
+                if let Some(i) = u.volume_for.get() {
+                    u.views[i].station.send(ToStation::SetVolume(u.volume.value().round() as u8));
+                }
             });
         }
         if let Some(t) = settle.borrow_mut().take() {
@@ -837,9 +844,10 @@ fn wire_volume(ui: &Rc<Ui>) {
         let (u, s) = (u.clone(), settle.clone());
         *settle.borrow_mut() = Some(glib::timeout_add_local_once(Duration::from_millis(600), move || {
             s.borrow_mut().take();
-            u.volume_busy.set(false);
-            let percent = u.volume.value().round() as u8;
-            tracing::info!(action = "their_volume", station = %u.view().station.config.name, percent, "ui.action");
+            if let Some(i) = u.volume_for.take() {
+                let percent = u.volume.value().round() as u8;
+                tracing::info!(action = "their_volume", station = %u.views[i].station.config.name, percent, "ui.action");
+            }
         }));
     });
 }
