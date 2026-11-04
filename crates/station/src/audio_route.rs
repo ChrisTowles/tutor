@@ -148,6 +148,11 @@ fn parse_volume(text: &str) -> Option<u8> {
     Some(percent.min(255) as u8)
 }
 
+/// Whether `name` is one of their outputs (`kind` = "sinks") or mics ("sources") right now.
+pub fn is_device(kind: &str, name: &str) -> bool {
+    usable(name) && names(kind).is_ok_and(|names| names.iter().any(|n| n == name))
+}
+
 /// Their outputs (`kind` = "sinks") or mics ("sources") as (name, description);
 /// the app sink and monitors excluded.
 pub fn devices(kind: &str) -> Result<Vec<(String, String)>> {

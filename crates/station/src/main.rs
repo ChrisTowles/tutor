@@ -148,7 +148,10 @@ fn main() -> Result<()> {
                         }
                     }
                     Ok(Some(ToStation::SetMic(mic))) => {
-                        if let Some(r) = route.lock().unwrap().as_mut() {
+                        // Only a mic they have: the name goes into pactl and a gst pipeline string.
+                        if !audio_route::is_device("sources", &mic) {
+                            out.status(format!("mic: no device {mic:?}"));
+                        } else if let Some(r) = route.lock().unwrap().as_mut() {
                             r.source = mic.clone();
                             media.set_source(&mic);
                         }
@@ -167,7 +170,10 @@ fn main() -> Result<()> {
                         let _ = loop_tx.send(LoopMsg::Point(at));
                     }
                     Ok(Some(ToStation::SetOutput(sink))) => {
-                        if let Some(r) = route.lock().unwrap().as_mut() {
+                        // Only an output they have: the name goes into pactl module args.
+                        if !audio_route::is_device("sinks", &sink) {
+                            out.status(format!("output: no device {sink:?}"));
+                        } else if let Some(r) = route.lock().unwrap().as_mut() {
                             match r.set_sink(&sink) {
                                 Ok(()) => media.set_sink(&sink),
                                 Err(e) => out.status(format!("output: {e:#}")),
@@ -313,13 +319,17 @@ fn watch_devices(route: Arc<Mutex<Option<Route>>>, media: Arc<Media>, out: out::
 /// the camera, the overlay and the audio route. The newest connection wins.
 fn replace_older() {
     let me = std::process::id().to_string();
-    let Ok(out) = std::process::Command::new("pgrep").args(["-x", "tutor-station"]).output() else { return };
-    let older: Vec<String> =
-        String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|p| *p != me).map(str::to_string).collect();
+    // Ours only: another user's station isn't ours to stop.
+    let Ok(uid) = fs::metadata("/proc/self").map(|m| m.uid().to_string()) else { return };
+    let running = || -> Vec<String> {
+        let Ok(out) = Command::new("pgrep").args(["-x", "-u", &uid, "tutor-station"]).output() else { return Vec::new() };
+        String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|p| *p != me).map(str::to_string).collect()
+    };
+    let older = running();
     if older.is_empty() {
         return;
     }
-    let _ = std::process::Command::new("kill").args(&older).status();
+    let _ = Command::new("kill").args(&older).status();
     // Let it tear down its audio route before we build ours: its teardown
     // unloads every tutor_apps module, ours included if we went first.
     let alive = || older.iter().filter(|p| fs::exists(format!("/proc/{p}")).unwrap_or(false)).count();
@@ -329,9 +339,10 @@ fn replace_older() {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    let stuck = alive() > 0;
-    if stuck {
-        let _ = std::process::Command::new("kill").arg("-KILL").args(&older).status();
+    // Look again rather than trust 5 s old PIDs: one may since belong to something else.
+    let stuck: Vec<String> = running().into_iter().filter(|p| older.contains(p)).collect();
+    if !stuck.is_empty() {
+        let _ = Command::new("kill").arg("-KILL").args(&stuck).status();
     }
-    tracing::info!(pids = older.join(" "), stuck, "station.replaced_older");
+    tracing::info!(pids = older.join(" "), stuck = stuck.join(" "), "station.replaced_older");
 }
